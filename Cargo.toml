@@ -1,0 +1,28 @@
+[package]
+name = "oterminal"
+version = "0.1.0"
+edition = "2021"
+description = "A GPU-accelerated terminal emulator: kitty-grade power, modern looks."
+
+[[bin]]
+name = "oterminal"
+path = "src/main.rs"
+
+[dependencies]
+alacritty_terminal = "0.26"
+arboard = "3"
+bytemuck = { version = "1", features = ["derive"] }
+cosmic-text = "0.19"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+pollster = "0.4"
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+unicode-width = "0.2"
+wgpu = "30"
+winit = { version = "0.30", features = ["rwh_06"] }
+
+[profile.release]
+lto = true

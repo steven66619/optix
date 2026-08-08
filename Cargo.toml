@@ -12,7 +12,7 @@ path = "src/main.rs"
 alacritty_terminal = "0.26"
 arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
-cosmic-text = "0.19"
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash", "fontconfig"] }
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"

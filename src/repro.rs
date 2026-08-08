@@ -128,6 +128,57 @@ fn sample_render(term: &mut Term<PaneProxy>, fonts: &mut Fonts, palette: &Palett
 }
 
 #[test]
+fn minimal_fonts_cover_tui_glyphs() {
+    let cfg = Config::load();
+    let mut fonts = Fonts::new(&cfg.font.family, cfg.font.size, 1.0).expect("fonts");
+    let glyphs = fonts.layout_line("· ┃ ╹ ▀ ■ ▣ ⬝ \u{2800}\u{2801}\u{28FF} box ⛰", false, false);
+    assert!(!glyphs.is_empty(), "minimal font set must shape TUI glyphs");
+    let bad = glyphs
+        .iter()
+        .filter(|g| g.cache_key.glyph_id == 0)
+        .count();
+    if bad > 0 {
+        let mut missing = String::new();
+        let chars: Vec<char> = "· ┃ ╹ ▀ ■ ▣ ⬝ \u{2800}\u{2801}\u{28FF} box ⛰".chars().collect();
+        for (i, g) in glyphs.iter().enumerate() {
+            if g.cache_key.glyph_id == 0 && i < chars.len() {
+                missing.push(chars[i]);
+            }
+        }
+        eprintln!("missing glyphs in minimal set: {:?}", missing);
+    }
+    assert_eq!(bad, 0, "{bad} glyphs were not found in the minimal font set");
+}
+
+#[test]
+fn startup_timing() {
+    let t0 = std::time::Instant::now();
+    let cfg = Config::load();
+    let t_cfg = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let fonts = Fonts::new(&cfg.font.family, cfg.font.size, 1.0).expect("fonts");
+    let t_fonts = t1.elapsed();
+    let t2 = std::time::Instant::now();
+    let palette = Palette::from_theme(&cfg.theme);
+    let t_palette = t2.elapsed();
+    let t3 = std::time::Instant::now();
+    let (term_arc, sender) = setup();
+    let t_term = t3.elapsed();
+    eprintln!(
+        "config={:?} fonts={:?} palette={:?} term+pty={:?} total={:?} font_cell={:.2}x{:.2} faces={}",
+        t_cfg,
+        t_fonts,
+        t_palette,
+        t_term,
+        t0.elapsed(),
+        fonts.cell_w,
+        fonts.cell_h,
+        fonts.font_system.db().len()
+    );
+    let _ = (term_arc, sender, palette);
+}
+
+#[test]
 fn opencode_stream_renders_without_panic() {
     let bytes = std::fs::read("/tmp/opencode/oc2.bin").expect("captured opencode output");
 

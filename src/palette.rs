@@ -80,7 +80,7 @@ impl Palette {
                 self.named(*named).unwrap_or(self.foreground)
             },
             Color::Indexed(idx) => {
-                if let Some(rgb) = dynamic[16 + *idx as usize] {
+                if let Some(rgb) = dynamic[*idx as usize] {
                     return from_ansi_rgb(rgb);
                 }
                 self.indexed_cube(*idx)

@@ -179,8 +179,27 @@ fn startup_timing() {
 }
 
 #[test]
+fn indexed_color_255_renders_without_panic() {
+    let cfg = Config::default_config();
+    let palette = Palette::from_theme(&cfg.theme);
+    let mut fonts = Fonts::new(&cfg.font.family, cfg.font.size, 1.0).expect("fonts");
+    let (term_arc, sender) = setup();
+    {
+        let mut guard = term_arc.lock();
+        feed(&mut guard, b"\x1b[38;5;255mX\x1b[0m");
+    }
+    let mut guard = term_arc.lock();
+    sample_render(&mut guard, &mut fonts, &palette);
+    let _ = sender;
+}
+
+#[test]
 fn opencode_stream_renders_without_panic() {
-    let bytes = std::fs::read("/tmp/opencode/oc2.bin").expect("captured opencode output");
+    // Local repro artifact captured from a live opencode session; skip when absent.
+    let Ok(bytes) = std::fs::read("/tmp/opencode/oc2.bin") else {
+        eprintln!("skipping: /tmp/opencode/oc2.bin not present");
+        return;
+    };
 
     let mut cfg = Config::default_config();
     cfg.font.size = 12.0;

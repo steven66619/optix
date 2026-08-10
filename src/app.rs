@@ -3,9 +3,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::event_loop::Msg;
 use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::tty::{Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
@@ -16,11 +17,12 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::color::from_ansi_rgb;
+use crate::color::{from_ansi_rgb, Rgba};
 use crate::config::{Config, ParsedTheme};
 use crate::event::{PaneEvent, PaneEventKind};
 use crate::fonts::Fonts;
 use crate::input::{self, Mods};
+use crate::kitty::{KittyImage, Placement, KITTY_MARKER};
 use crate::layout::{self, Layout, Orientation, PaneId, Rect};
 use crate::palette::Palette;
 use crate::render::{Frame, Renderer};
@@ -39,7 +41,7 @@ enum SearchAction {
 }
 
 /// The terminal application.
-pub struct OtermApp {
+pub struct OptixApp {
     config: Config,
     window: Option<Window>,
     renderer: Option<Renderer>,
@@ -49,6 +51,7 @@ pub struct OtermApp {
     next_pane_id: PaneId,
     event_tx: mpsc::Sender<PaneEvent>,
     event_rx: mpsc::Receiver<PaneEvent>,
+    el_wakeup: winit::event_loop::EventLoopProxy<()>,
     palette: Palette,
     search: Option<SearchOverlay>,
     bell_flash: Option<Instant>,
@@ -64,8 +67,13 @@ pub struct OtermApp {
     default_title: String,
 }
 
-impl OtermApp {
-    pub fn new(config: Config, event_tx: mpsc::Sender<PaneEvent>, event_rx: mpsc::Receiver<PaneEvent>) -> Self {
+impl OptixApp {
+    pub fn new(
+        config: Config,
+        event_tx: mpsc::Sender<PaneEvent>,
+        event_rx: mpsc::Receiver<PaneEvent>,
+        el_wakeup: winit::event_loop::EventLoopProxy<()>,
+    ) -> Self {
         let palette = Palette::from_theme(&config.theme);
         let base_font_size = config.font.size;
         Self {
@@ -83,6 +91,7 @@ impl OtermApp {
             next_pane_id: 0,
             event_tx,
             event_rx,
+            el_wakeup,
             search: None,
             bell_flash: None,
             focused: true,
@@ -118,6 +127,7 @@ impl OtermApp {
         let shell = self.config.shell.clone().map(|s| Shell::new(s, Vec::new()));
         let mut env = HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
         PtyOptions {
             shell,
             working_directory: self.config.working_directory.clone(),
@@ -133,7 +143,7 @@ impl OtermApp {
         let fonts = self.fonts.as_ref().expect("fonts ready");
         let cell_w = fonts.cell_w as u16;
         let cell_h = fonts.cell_h as u16;
-        match TerminalPane::new(id, &opts, cols, lines, cell_w, cell_h, self.event_tx.clone()) {
+        match TerminalPane::new(id, &opts, cols, lines, cell_w, cell_h, self.event_tx.clone(), Some(self.el_wakeup.clone())) {
             Ok(pane) => {
                 self.panes.insert(id, pane);
                 Some(id)
@@ -209,7 +219,8 @@ impl OtermApp {
         }
         self.layout.refresh_focus();
         if let Some(pane) = self.panes.remove(&id) {
-            let _ = pane.pty.send(Msg::Shutdown);
+            let mut pane = pane;
+            pane.quit();
         }
     }
 
@@ -242,11 +253,20 @@ impl OtermApp {
             .filter(|t| !t.is_empty());
         if let Some(text) = text {
             self.store_clipboard(&text);
+            self.store_selection(&text);
         }
     }
 
     fn paste(&mut self) {
         if let Some(text) = self.load_clipboard() {
+            if let Some(pane) = self.focused_pane() {
+                pane.write_str(&text);
+            }
+        }
+    }
+
+    fn paste_selection(&mut self) {
+        if let Some(text) = self.load_selection() {
             if let Some(pane) = self.focused_pane() {
                 pane.write_str(&text);
             }
@@ -267,6 +287,40 @@ impl OtermApp {
             self.clipboard = arboard::Clipboard::new().ok();
         }
         self.clipboard.as_mut().and_then(|c| c.get_text().ok())
+    }
+
+    /// Store text in the PRIMARY selection buffer (X11 middle-click paste).
+    fn store_selection(&mut self, text: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            if self.clipboard.is_none() {
+                self.clipboard = arboard::Clipboard::new().ok();
+            }
+            if let Some(c) = &mut self.clipboard {
+                let _ = c.set().clipboard(LinuxClipboardKind::Primary).text(text.to_string());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = text;
+    }
+
+    /// Load text from the PRIMARY selection buffer (X11 middle-click paste).
+    fn load_selection(&mut self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            use arboard::{GetExtLinux, LinuxClipboardKind};
+            if self.clipboard.is_none() {
+                self.clipboard = arboard::Clipboard::new().ok();
+            }
+            self.clipboard
+                .as_mut()
+                .and_then(|c| c.get().clipboard(LinuxClipboardKind::Primary).text().ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     fn open_search(&mut self) {
@@ -356,31 +410,43 @@ impl OtermApp {
             return;
         }
 
-        match input::resolve(&event, self.mods, &self.config.keybindings) {
-            input::BindingResult::Action(action) => {
-                self.handle_action(&action);
-                return;
-            },
-            input::BindingResult::Passthrough => {},
+        // Resolve keybindings once per physical press; ignore auto-repeat so
+        // actions like paste do not fire on key release or while held.
+        if event.state == ElementState::Pressed && !event.repeat {
+            match input::resolve(&event, self.mods, &self.config.keybindings) {
+                input::BindingResult::Action(action) => {
+                    self.handle_action(&action);
+                    return;
+                },
+                input::BindingResult::Passthrough => {},
+            }
         }
 
         if event.state != ElementState::Pressed {
-            return;
+            // Forward releases only when the kitty keyboard protocol requests
+            // them; otherwise ignore them here.
+            let id = self.layout.focused();
+            let report_events = self
+                .panes
+                .get(&id)
+                .map(|pane| pane.term.lock().mode().contains(TermMode::REPORT_EVENT_TYPES))
+                .unwrap_or(false);
+            if !report_events {
+                return;
+            }
         }
 
         let mods = self.mods;
-        let (app_cursor, app_keypad) = {
+        let mode = {
             let id = self.layout.focused();
             if let Some(pane) = self.panes.get(&id) {
-                let guard = pane.term.lock();
-                let mode = guard.mode();
-                (mode.contains(TermMode::APP_CURSOR), mode.contains(TermMode::APP_KEYPAD))
+                *pane.term.lock().mode()
             } else {
-                (false, false)
+                TermMode::default()
             }
         };
 
-        let bytes = input::encode_key(&event, mods, app_cursor, app_keypad);
+        let bytes = input::encode_key(&event, mods, mode);
         if !bytes.is_empty() {
             if let Some(pane) = self.focused_pane() {
                 pane.write(&bytes);
@@ -448,9 +514,16 @@ impl OtermApp {
     }
 
     fn on_mouse(&mut self, state: ElementState, button: MouseButton) {
-        if button != MouseButton::Left {
-            return;
+        match button {
+            MouseButton::Left => self.on_mouse_left(state),
+            // X11 convention: middle-click pastes the PRIMARY selection. Fire on
+            // press only, otherwise the click's press + release would paste twice.
+            MouseButton::Middle if state == ElementState::Pressed => self.paste_selection(),
+            _ => {},
         }
+    }
+
+    fn on_mouse_left(&mut self, state: ElementState) {
         let pos = self.mouse_pos;
 
         match state {
@@ -469,7 +542,7 @@ impl OtermApp {
                             pad_x,
                             pad_y,
                         );
-                        pane.start_selection(point);
+                        pane.start_selection(SelectionType::Simple, point);
                         self.dragging = true;
                     }
                 }
@@ -524,11 +597,18 @@ impl OtermApp {
                 PaneEventKind::Bell => {
                     self.bell_flash = Some(Instant::now());
                 },
-                PaneEventKind::ClipboardStore(_, text) => {
-                    self.store_clipboard(&text);
+                PaneEventKind::ClipboardStore(ty, text) => {
+                    match ty {
+                        ClipboardType::Clipboard => self.store_clipboard(&text),
+                        ClipboardType::Selection => self.store_selection(&text),
+                    }
                 },
-                PaneEventKind::ClipboardLoad(_, formatter) => {
-                    if let Some(text) = self.load_clipboard() {
+                PaneEventKind::ClipboardLoad(ty, formatter) => {
+                    let text = match ty {
+                        ClipboardType::Clipboard => self.load_clipboard(),
+                        ClipboardType::Selection => self.load_selection(),
+                    };
+                    if let Some(text) = text {
                         let formatted = formatter(&text);
                         if let Some(pane) = self.panes.get_mut(&ev.pane_id) {
                             pane.write_str(&formatted);
@@ -598,18 +678,20 @@ impl OtermApp {
 
         let mut frame = Frame::default();
 
-        // Window background: image, gradient, or flat color.
+        // Window background: image, gradient, or flat color. The whole window
+        // is faded to `opacity` so a transparent (ARGB) surface lets picom
+        // composite the desktop wallpaper through it.
         if renderer.has_background_image() {
-            frame.image_quad(0.0, 0.0, w, h, renderer.background_uv());
+            frame.image_quad(0.0, 0.0, w, h, renderer.background_uv(), Rgba::from_rgba(1.0, 1.0, 1.0, opacity));
         } else if let Some((top, bottom)) = theme.background_gradient {
             let slices = 32.0;
             for i in 0..slices as usize {
                 let t = i as f32 / slices;
                 let y = h * t;
-                frame.rect(0.0, y, w, h / slices + 1.0, top.lerp(bottom, t));
+                frame.rect(0.0, y, w, h / slices + 1.0, top.lerp(bottom, t).with_alpha(opacity));
             }
         } else {
-            frame.rect(0.0, 0.0, w, h, palette.background);
+            frame.rect(0.0, 0.0, w, h, palette.background.with_alpha(opacity));
         }
 
         let rects = self.layout.tab().layout_rects(area);
@@ -642,6 +724,39 @@ impl OtermApp {
                 );
             }
         }
+
+        // Upload kitty-graphics textures and push their placement quads.
+        let mut keep = std::collections::HashSet::new();
+        for (id, rect) in rects.iter().copied() {
+            let Some(pane) = self.panes.get_mut(&id) else { continue };
+            let cell_w = fonts.cell_w;
+            let cell_h = fonts.cell_h;
+            let store = pane.kitty.lock().unwrap_or_else(|e| e.into_inner());
+            for img in store.images.values() {
+                keep.insert(img.gen);
+                renderer.upload_image(img.gen, img.width, img.height, &img.rgba);
+            }
+            for p in &store.placements {
+                let Some(img) = store.images.get(&p.image_id) else { continue };
+                if let Some((x, y, w, h)) = placement_quad(p, img, &rect, pad_x, pad_y, cell_w, cell_h) {
+                    log::debug!(
+                        "kitty quad {}x{} at ({:.0},{:.0}) cell={:.2}x{:.2} rect={rect:?} src={}x{} cells={:?}x{:?}",
+                        w,
+                        h,
+                        x,
+                        y,
+                        cell_w,
+                        cell_h,
+                        img.width,
+                        img.height,
+                        p.cells_w,
+                        p.cells_h
+                    );
+                    frame.kitty_quad(x, y, w, h, p.gen);
+                }
+            }
+        }
+        renderer.prune_images(&keep);
 
         for border in self.layout.tab().split_borders(area) {
             frame.rect(border.x, border.y, border.w, border.h, theme.split_border);
@@ -694,6 +809,44 @@ fn draw_search_overlay(
     }
 }
 
+/// Compute the screen-space quad for a kitty placement, preserving the image's
+/// aspect ratio when only one dimension is specified.
+fn placement_quad(
+    p: &Placement,
+    img: &KittyImage,
+    rect: &Rect,
+    pad_x: f32,
+    pad_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let src_w = img.width as f32;
+    let src_h = img.height as f32;
+    if src_w <= 0.0 || src_h <= 0.0 {
+        return None;
+    }
+    let (w, h) = match (p.cells_w, p.cells_h) {
+        (Some(c), Some(r)) => (c * cell_w, r * cell_h),
+        (Some(c), None) => {
+            let w = c * cell_w;
+            (w, w * src_h / src_w)
+        },
+        (None, Some(r)) => {
+            let h = r * cell_h;
+            (h * src_w / src_h, h)
+        },
+        (None, None) => match (p.px_w, p.px_h) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w * src_h / src_w),
+            (None, Some(h)) => (h * src_w / src_h, h),
+            (None, None) => (src_w, src_h),
+        },
+    };
+    let x = rect.x + pad_x + p.col as f32 * cell_w;
+    let y = rect.y + pad_y + p.row as f32 * cell_h;
+    Some((x, y, w, h))
+}
+
 /// Draw a single pane's grid, cursor, and search highlights into the frame.
 #[allow(clippy::too_many_arguments)]
 fn render_pane(
@@ -719,6 +872,7 @@ fn render_pane(
     let display_offset = content.display_offset as i32;
     let dynamic = content.colors;
     let cursor = content.cursor;
+    let selection = guard.selection.as_ref().and_then(|s| s.to_range(&guard));
     log::debug!("pane {} rect={rect:?} cols={} lines={} cursor_shape={:?} at={:?}", pane.id, pane.cols, pane.lines, cursor.shape, cursor.point);
 
     let mut cell_count = 0usize;
@@ -783,11 +937,14 @@ fn render_pane(
             }
         }
 
-        if cell.c != ' ' {
+        if selection.as_ref().map(|r| r.contains(point)).unwrap_or(false) {
+            frame.rect(x, y, cell_w, cell_h, theme.selection_background);
+        }
+
+        if cell.c != ' ' && cell.c != KITTY_MARKER {
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
-            let glyphs = fonts.layout_line(&cell.c.to_string(), bold, italic);
-            for g in glyphs {
+            for g in fonts.layout_cell(cell.c, bold, italic) {
                 frame.glyph(x + g.x, y + g.y, g.cache_key, cell_fg);
             }
         }
@@ -816,7 +973,7 @@ fn render_pane(
                         frame.rect(cx, cy, cell_w, cell_h, cursor_color);
                         if let Some(ct) = palette.cursor_text {
                             let ch = guard.grid()[cursor.point.line][cursor.point.column].c;
-                            if ch != ' ' {
+                            if ch != ' ' && ch != KITTY_MARKER {
                                 let glyphs = fonts.layout_line(&ch.to_string(), false, false);
                                 for g in glyphs {
                                     frame.glyph(cx + g.x, cy + g.y, g.cache_key, ct);
@@ -843,7 +1000,7 @@ fn render_pane(
     }
 }
 
-impl ApplicationHandler for OtermApp {
+impl ApplicationHandler for OptixApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -853,6 +1010,7 @@ impl ApplicationHandler for OtermApp {
         let height = self.config.window.height;
         let attrs = Window::default_attributes()
             .with_title(&self.config.window.title)
+            .with_transparent(self.config.window.transparent)
             .with_inner_size(PhysicalSize::new(width, height));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => w,
@@ -947,8 +1105,11 @@ impl ApplicationHandler for OtermApp {
                 self.window().request_redraw();
             },
             WindowEvent::CursorMoved { position, .. } => {
+                let was_dragging = self.dragging;
                 self.on_mouse_move(position);
-                self.window().request_redraw();
+                if was_dragging {
+                    self.window().request_redraw();
+                }
             },
             WindowEvent::RedrawRequested => {
                 self.draw();

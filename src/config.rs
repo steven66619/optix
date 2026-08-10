@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::Rgba;
 
-pub const DEFAULT_CONFIG_DIR: &str = "oterminal";
+pub const DEFAULT_CONFIG_DIR: &str = "optix";
 
 /// Parsed configuration with all colors resolved.
 #[derive(Debug, Clone)]
@@ -55,6 +55,10 @@ impl Default for Font {
 pub struct Window {
     /// Window opacity, `0.0` = fully transparent, `1.0` = opaque.
     pub opacity: f32,
+    /// Whether the window uses a transparent (ARGB) surface so a compositor
+    /// such as picom can composite the desktop wallpaper through the terminal.
+    /// Requires a running compositor; without one the window appears black.
+    pub transparent: bool,
     /// Path to a background image (PNG). Painted behind the terminal.
     pub background_image: Option<PathBuf>,
     /// Radius of rounded window/content corners in pixels.
@@ -72,12 +76,13 @@ impl Default for Window {
     fn default() -> Self {
         Self {
             opacity: 0.97,
+            transparent: false,
             background_image: None,
             corner_radius: 12.0,
             glow: true,
             width: 1080,
             height: 680,
-            title: "Oterminal".to_string(),
+            title: "Optix".to_string(),
         }
     }
 }
@@ -200,7 +205,7 @@ impl Config {
         }
     }
 
-    /// Load configuration from `~/.config/oterminal/config.toml` merged with defaults.
+    /// Load configuration from `~/.config/optix/config.toml` merged with defaults.
     pub fn load() -> Self {
         let path = config_path();
         let mut cfg = match fs::read_to_string(&path) {
@@ -346,7 +351,7 @@ fn default_keybindings() -> HashMap<String, String> {
     .collect()
 }
 
-const EXAMPLE_CONFIG: &str = r##"# Oterminal configuration.
+const EXAMPLE_CONFIG: &str = r##"# Optix configuration.
 # This file is regenerated on first launch; all fields are optional.
 
 [font]
@@ -357,12 +362,14 @@ padding_y = 10.0
 
 [window]
 opacity = 0.97                # 0.0 ..= 1.0
+transparent = false           # true = ARGB window so picom shows the wallpaper through
+                              # (needs a compositor running; combine with opacity < 1.0)
 # background_image = "/path/to/image.png"
 corner_radius = 12.0
 glow = true
 width = 1080
 height = 680
-title = "Oterminal"
+title = "Optix"
 
 [theme]
 background = "#1e1e2e"

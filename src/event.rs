@@ -40,10 +40,16 @@ pub struct PaneEvent {
 pub struct PaneProxy {
     pub pane_id: usize,
     pub tx: mpsc::Sender<PaneEvent>,
+    /// Wakes the winit event loop so queued `PaneEvent`s get drained promptly,
+    /// even while the loop is idle in `ControlFlow::Wait`. `None` in tests.
+    pub el_wakeup: Option<winit::event_loop::EventLoopProxy<()>>,
 }
 
 impl EventListener for PaneProxy {
     fn send_event(&self, event: Event) {
+        if let Some(el) = &self.el_wakeup {
+            let _ = el.send_event(());
+        }
         let kind = match event {
             Event::MouseCursorDirty | Event::Wakeup => PaneEventKind::Wakeup,
             Event::Title(title) => PaneEventKind::Title(Some(title)),

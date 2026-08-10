@@ -1,9 +1,8 @@
 use std::ops::RangeInclusive;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::event_loop::{EventLoop, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -13,6 +12,8 @@ use alacritty_terminal::term::{cell::Flags, Config as TermConfig, Term, TermMode
 use alacritty_terminal::tty::{self, Options as PtyOptions};
 
 use crate::event::{PaneEvent, PaneProxy};
+use crate::kitty::KittyStore;
+use crate::pty_io::{PtyIo, PtyMsg};
 
 /// Search state for one terminal pane.
 pub struct SearchState {
@@ -29,7 +30,9 @@ pub struct SearchState {
 pub struct TerminalPane {
     pub id: usize,
     pub term: Arc<FairMutex<Term<PaneProxy>>>,
-    pub pty: alacritty_terminal::event_loop::EventLoopSender,
+    pub pty: PtyIo,
+    /// Per-pane kitty-graphics store, populated by the PTY thread.
+    pub kitty: Arc<Mutex<KittyStore>>,
     pub title: String,
     pub search: Option<SearchState>,
     /// Whether the terminal had damage since the last frame.
@@ -67,13 +70,16 @@ impl TerminalPane {
         cell_w: u16,
         cell_h: u16,
         tx: mpsc::Sender<PaneEvent>,
+        el_wakeup: Option<winit::event_loop::EventLoopProxy<()>>,
     ) -> std::io::Result<Self> {
-        let term_config = TermConfig { kitty_keyboard: false, ..TermConfig::default() };
+        let term_config = TermConfig { kitty_keyboard: true, ..TermConfig::default() };
 
         let dims = PaneSize { columns: cols, screen_lines: lines };
-        let proxy_a = PaneProxy { pane_id: id, tx: tx.clone() };
-        let proxy_b = PaneProxy { pane_id: id, tx };
+        let proxy_a = PaneProxy { pane_id: id, tx: tx.clone(), el_wakeup: el_wakeup.clone() };
+        let proxy_b = PaneProxy { pane_id: id, tx, el_wakeup };
         let term = Arc::new(FairMutex::new(Term::new(term_config, &dims, proxy_a)));
+
+        let kitty = Arc::new(Mutex::new(KittyStore::new()));
 
         let window_size = WindowSize {
             num_lines: lines as u16,
@@ -83,14 +89,13 @@ impl TerminalPane {
         };
 
         let pty = tty::new(pty_opts, window_size, id as u64)?;
-        let event_loop = EventLoop::new(term.clone(), proxy_b, pty, false, false)?;
-        let channel = event_loop.channel();
-        event_loop.spawn();
+        let io = PtyIo::spawn(pty, term.clone(), kitty.clone(), proxy_b);
 
         Ok(Self {
             id,
             term,
-            pty: channel,
+            pty: io,
+            kitty,
             title: String::new(),
             search: None,
             dirty: true,
@@ -101,10 +106,11 @@ impl TerminalPane {
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        let _ = self.pty.send(Msg::Input(std::borrow::Cow::Owned(bytes.to_vec())));
+        self.pty.send(PtyMsg::Write(bytes.to_vec()));
     }
 
     pub fn write_str(&mut self, s: &str) {
+        log::debug!("term write_str {:?}", s);
         self.write(s.as_bytes());
     }
 
@@ -119,9 +125,12 @@ impl TerminalPane {
         let mut guard = self.term.lock();
         guard.resize(size);
         drop(guard);
-        let _ = self
-            .pty
-            .send(Msg::Resize(WindowSize { num_lines: lines as u16, num_cols: cols as u16, cell_width: cell_w, cell_height: cell_h }));
+        self.pty.send(PtyMsg::Resize(WindowSize { num_lines: lines as u16, num_cols: cols as u16, cell_width: cell_w, cell_height: cell_h }));
+    }
+
+    /// Ask the PTY thread to shut down.
+    pub fn quit(&mut self) {
+        self.pty.send(PtyMsg::Shutdown);
     }
 
     pub fn set_focus(&mut self, focused: bool) {
@@ -154,9 +163,9 @@ impl TerminalPane {
         guard.selection = None;
     }
 
-    pub fn start_selection(&mut self, point: Point) {
+    pub fn start_selection(&mut self, sel_type: SelectionType, point: Point) {
         let mut guard = self.term.lock();
-        guard.selection = Some(Selection::new(SelectionType::Simple, point, cell_side(point)));
+        guard.selection = Some(Selection::new(sel_type, point, cell_side(point)));
     }
 
     pub fn update_selection(&mut self, point: Point) {

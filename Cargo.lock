@@ -1597,6 +1597,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "optix"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "arboard",
+ "base64",
+ "bytemuck",
+ "cosmic-text",
+ "env_logger",
+ "image",
+ "libc",
+ "log",
+ "miniz_oxide",
+ "pollster",
+ "raw-window-handle",
+ "serde",
+ "toml",
+ "unicode-width",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1613,26 +1636,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "oterminal"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "arboard",
- "bytemuck",
- "cosmic-text",
- "env_logger",
- "image",
- "log",
- "pollster",
- "raw-window-handle",
- "serde",
- "toml",
- "unicode-width",
- "wgpu",
- "winit",
 ]
 
 [[package]]

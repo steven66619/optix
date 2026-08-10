@@ -1,8 +1,10 @@
 /// Keyboard input handling: keybinding resolution and terminal key encoding.
 use std::collections::HashMap;
 
-use winit::event::KeyEvent;
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use alacritty_terminal::term::TermMode;
+use winit::event::{ElementState, KeyEvent};
+use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 /// Modifier state relevant for keybindings.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
@@ -252,22 +254,37 @@ pub fn resolve(event: &KeyEvent, mods: Mods, bindings: &HashMap<String, String>)
 
 /// Convert a key event into bytes for the terminal.
 ///
-/// `app_cursor` reflects DECCKM (application cursor keys mode); `app_keypad`
-/// reflects DECKPAM. Returns an empty vec when the key produces no output.
-pub fn encode_key(event: &KeyEvent, mods: Mods, app_cursor: bool, _app_keypad: bool) -> Vec<u8> {
-    use winit::event::ElementState;    if event.state != ElementState::Pressed {
+/// `mode` is the focused pane's current [`TermMode`]. It selects between the
+/// kitty keyboard protocol (CSI `u` sequences) and classic encodings, and
+/// drives DECCKM/DECKPAM behavior. Returns an empty vec when the key produces
+/// no output.
+pub fn encode_key(event: &KeyEvent, mods: Mods, mode: TermMode) -> Vec<u8> {
+    let kitty_seq = kitty_active(mode);
+
+    // Released keys are only reported under the kitty protocol's
+    // `report_event_types` mode; otherwise a release produces no bytes.
+    if event.state != ElementState::Pressed {
+        if kitty_seq && mode.contains(TermMode::REPORT_EVENT_TYPES) {
+            return encode_released(event, mods, mode);
+        }
         return Vec::new();
     }
 
-    // Shift is tracked separately for alt handling; ctrl suppresses text.
-    let ctrl = mods.ctrl;
-    let alt = mods.alt;
-    let _shift = mods.shift;
+    if kitty_seq {
+        encode_pressed_kitty(event, mods, mode)
+    } else {
+        encode_classic(event, mods, mode)
+    }
+}
+
+/// Classic (pre-kitty) key encoding: control characters, ESC-prefixed Alt,
+/// and DEC-style sequences for named keys.
+fn encode_classic(event: &KeyEvent, mods: Mods, mode: TermMode) -> Vec<u8> {
+    let app_cursor = mode.contains(TermMode::APP_CURSOR);
 
     // Named keys with dedicated sequences.
     if let Key::Named(named) = &event.logical_key {
-        let seq = named_sequence(*named, mods, app_cursor);
-        if let Some(seq) = seq {
+        if let Some(seq) = named_sequence(*named, mods, app_cursor) {
             return seq;
         }
     }
@@ -279,7 +296,7 @@ pub fn encode_key(event: &KeyEvent, mods: Mods, app_cursor: bool, _app_keypad: b
             let c = ch.as_bytes()[0];
 
             // Control characters: ctrl+letter, ctrl+[ \ ] ^ _ @ space 2.
-            if ctrl {
+            if mods.ctrl {
                 let code = match c {
                     b' ' | b'2' => Some(0x00u8),
                     b'[' => Some(0x1b),
@@ -297,7 +314,7 @@ pub fn encode_key(event: &KeyEvent, mods: Mods, app_cursor: bool, _app_keypad: b
             }
 
             // Alt produces ESC-prefixed characters.
-            if alt {
+            if mods.alt {
                 return vec![0x1b, c];
             }
 
@@ -306,12 +323,438 @@ pub fn encode_key(event: &KeyEvent, mods: Mods, app_cursor: bool, _app_keypad: b
         }
 
         // Multi-char or special text (e.g. emoji): send as-is when not modified.
-        if !ctrl && !alt {
+        if !mods.ctrl && !mods.alt {
             return ch.as_bytes().to_vec();
         }
     }
 
     Vec::new()
+}
+
+/// Encode a key press under the kitty keyboard protocol.
+fn encode_pressed_kitty(event: &KeyEvent, mods: Mods, mode: TermMode) -> Vec<u8> {
+    let text = event.text.clone().unwrap_or_default();
+
+    // Alt on keys with text is sent as an ESC prefix, so it is masked out of
+    // the modifier bits (kitty protocol). Alt on keys without text stays a
+    // modifier.
+    let mods = if mods.alt && alt_send_esc(event, &text) {
+        Mods { alt: false, ..mods }
+    } else {
+        mods
+    };
+
+    if should_build_sequence(event, &text, mode, mods) {
+        build_kitty_sequence(event, mods, mode)
+    } else {
+        let mut bytes = Vec::new();
+        if mods.alt {
+            bytes.push(b'\x1b');
+        }
+        bytes.extend_from_slice(text.as_bytes());
+        bytes
+    }
+}
+
+/// Encode a key release under the kitty keyboard protocol.
+fn encode_released(event: &KeyEvent, mods: Mods, mode: TermMode) -> Vec<u8> {
+    // Enter/Tab/Backspace never report releases unless every key is encoded.
+    match &event.logical_key {
+        Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace)
+            if !mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) =>
+        {
+            return Vec::new();
+        },
+        _ => {},
+    }
+
+    let text = event.text.clone().unwrap_or_default();
+    let mods = if mods.alt && alt_send_esc(event, &text) {
+        Mods { alt: false, ..mods }
+    } else {
+        mods
+    };
+
+    build_kitty_sequence(event, mods, mode)
+}
+
+/// Whether `Alt` should be encoded as an ESC prefix rather than a modifier.
+fn alt_send_esc(event: &KeyEvent, text: &str) -> bool {
+    match &event.logical_key {
+        Key::Named(named) => named.to_text().is_some(),
+        Key::Character(_) => text.chars().count() == 1,
+        _ => false,
+    }
+}
+
+/// Decide whether a key should be emitted as an escape sequence or as raw text.
+fn should_build_sequence(event: &KeyEvent, text: &str, mode: TermMode, mods: Mods) -> bool {
+    if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+        return true;
+    }
+
+    // Only shift (no ctrl/alt/super) pressed.
+    let only_shift = mods.shift && !mods.ctrl && !mods.alt && !mods.super_;
+
+    let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
+        && (matches!(event.logical_key, Key::Named(NamedKey::Escape))
+            || event.location == KeyLocation::Numpad
+            || (!mods.is_empty()
+                && (!only_shift
+                    || matches!(
+                        event.logical_key,
+                        Key::Named(NamedKey::Tab | NamedKey::Enter | NamedKey::Backspace)
+                    ))));
+
+    match &event.logical_key {
+        _ if disambiguate => true,
+        Key::Named(named) => named.to_text().is_none(),
+        _ => text.is_empty(),
+    }
+}
+
+/// Build a kitty keyboard protocol (CSI `u`) sequence for `event`.
+fn build_kitty_sequence(event: &KeyEvent, mods: Mods, mode: TermMode) -> Vec<u8> {
+    use std::fmt::Write;
+
+    let mut modifiers = kitty_modifiers(mods);
+    let kitty_encode_all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    let kitty_event_type = mode.contains(TermMode::REPORT_EVENT_TYPES)
+        && (event.repeat || event.state == ElementState::Released);
+
+    let associated_text = event.text.as_deref().filter(|text| {
+        mode.contains(TermMode::REPORT_ASSOCIATED_TEXT)
+            && event.state != ElementState::Released
+            && !text.is_empty()
+            && !is_control_character(text)
+    });
+
+    let base = kitty_numpad(event)
+        .or_else(|| kitty_named_key(event))
+        .or_else(|| kitty_named_legacy(event, modifiers, kitty_event_type, associated_text.is_some()))
+        .or_else(|| kitty_control_or_modifier(event, &mut modifiers, mode))
+        .or_else(|| kitty_textual(event, mode, modifiers, kitty_encode_all, associated_text));
+
+    let Some((payload, terminator)) = base else { return Vec::new() };
+
+    let mut out = format!("\x1b[{payload}");
+    if kitty_event_type || modifiers != 0 || associated_text.is_some() {
+        let _ = write!(out, ";{}", modifiers + 1);
+    }
+    if kitty_event_type {
+        let _ = write!(out, ":{}", match event.state {
+            _ if event.repeat => '2',
+            ElementState::Pressed => '1',
+            ElementState::Released => '3',
+        });
+    }
+    if let Some(text) = associated_text {
+        let mut codepoints = text.chars().map(u32::from);
+        if let Some(codepoint) = codepoints.next() {
+            let _ = write!(out, ";{codepoint}");
+        }
+        for codepoint in codepoints {
+            let _ = write!(out, ":{codepoint}");
+        }
+    }
+    out.push(terminator);
+    out.into_bytes()
+}
+
+type SequenceBase = (String, char);
+
+/// Map a numpad key to its kitty base key code.
+fn kitty_numpad(event: &KeyEvent) -> Option<SequenceBase> {
+    if event.location != KeyLocation::Numpad {
+        return None;
+    }
+    let base = match &event.logical_key {
+        Key::Character(ch) => match ch.as_str() {
+            "0" => "57399",
+            "1" => "57400",
+            "2" => "57401",
+            "3" => "57402",
+            "4" => "57403",
+            "5" => "57404",
+            "6" => "57405",
+            "7" => "57406",
+            "8" => "57407",
+            "9" => "57408",
+            "." => "57409",
+            "/" => "57410",
+            "*" => "57411",
+            "-" => "57412",
+            "+" => "57413",
+            "=" => "57415",
+            _ => return None,
+        },
+        Key::Named(named) => match *named {
+            NamedKey::Enter => "57414",
+            NamedKey::ArrowLeft => "57417",
+            NamedKey::ArrowRight => "57418",
+            NamedKey::ArrowUp => "57419",
+            NamedKey::ArrowDown => "57420",
+            NamedKey::PageUp => "57421",
+            NamedKey::PageDown => "57422",
+            NamedKey::Home => "57423",
+            NamedKey::End => "57424",
+            NamedKey::Insert => "57425",
+            NamedKey::Delete => "57426",
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((base.to_string(), 'u'))
+}
+
+/// Kitky protocol key codes for keys that do not map to a classic sequence.
+fn kitty_named_key(event: &KeyEvent) -> Option<SequenceBase> {
+    let named = match &event.logical_key {
+        Key::Named(named) => *named,
+        _ => return None,
+    };
+    let base = match named {
+        // F3 diverges from the classic `CSI R` to avoid colliding with DA.
+        NamedKey::F3 => "13",
+        NamedKey::F13 => "57376",
+        NamedKey::F14 => "57377",
+        NamedKey::F15 => "57378",
+        NamedKey::F16 => "57379",
+        NamedKey::F17 => "57380",
+        NamedKey::F18 => "57381",
+        NamedKey::F19 => "57382",
+        NamedKey::F20 => "57383",
+        NamedKey::F21 => "57384",
+        NamedKey::F22 => "57385",
+        NamedKey::F23 => "57386",
+        NamedKey::F24 => "57387",
+        NamedKey::F25 => "57388",
+        NamedKey::F26 => "57389",
+        NamedKey::F27 => "57390",
+        NamedKey::F28 => "57391",
+        NamedKey::F29 => "57392",
+        NamedKey::F30 => "57393",
+        NamedKey::F31 => "57394",
+        NamedKey::F32 => "57395",
+        NamedKey::F33 => "57396",
+        NamedKey::F34 => "57397",
+        NamedKey::F35 => "57398",
+        NamedKey::ScrollLock => "57359",
+        NamedKey::PrintScreen => "57361",
+        NamedKey::Pause => "57362",
+        NamedKey::ContextMenu => "57363",
+        _ => return None,
+    };
+    Some((base.to_string(), 'u'))
+}
+
+/// Classic sequences reused by the kitty protocol (e.g. `CSI 5~`, `CSI 1;5A`).
+fn kitty_named_legacy(
+    event: &KeyEvent,
+    modifiers: u8,
+    kitty_event_type: bool,
+    has_associated_text: bool,
+) -> Option<SequenceBase> {
+    let named = match &event.logical_key {
+        Key::Named(named) => *named,
+        _ => return None,
+    };
+
+    // The kitty protocol requires the base parameter to be explicit whenever
+    // modifiers or an event type are attached (`CSI 1;5A` instead of `CSI A`).
+    let one_based = if modifiers == 0 && !kitty_event_type && !has_associated_text {
+        ""
+    } else {
+        "1"
+    };
+
+    let (base, terminator) = match named {
+        NamedKey::PageUp => ("5", '~'),
+        NamedKey::PageDown => ("6", '~'),
+        NamedKey::Insert => ("2", '~'),
+        NamedKey::Delete => ("3", '~'),
+        NamedKey::Home => (one_based, 'H'),
+        NamedKey::End => (one_based, 'F'),
+        NamedKey::ArrowLeft => (one_based, 'D'),
+        NamedKey::ArrowRight => (one_based, 'C'),
+        NamedKey::ArrowUp => (one_based, 'A'),
+        NamedKey::ArrowDown => (one_based, 'B'),
+        NamedKey::F1 => (one_based, 'P'),
+        NamedKey::F2 => (one_based, 'Q'),
+        NamedKey::F3 => (one_based, 'R'),
+        NamedKey::F4 => (one_based, 'S'),
+        NamedKey::F5 => ("15", '~'),
+        NamedKey::F6 => ("17", '~'),
+        NamedKey::F7 => ("18", '~'),
+        NamedKey::F8 => ("19", '~'),
+        NamedKey::F9 => ("20", '~'),
+        NamedKey::F10 => ("21", '~'),
+        NamedKey::F11 => ("23", '~'),
+        NamedKey::F12 => ("24", '~'),
+        _ => return None,
+    };
+
+    Some((base.to_string(), terminator))
+}
+
+/// Control keys and modifier keys under the kitty protocol.
+fn kitty_control_or_modifier(
+    event: &KeyEvent,
+    modifiers: &mut u8,
+    mode: TermMode,
+) -> Option<SequenceBase> {
+    let kitty_encode_all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    if !kitty_encode_all && !kitty_active(mode) {
+        return None;
+    }
+
+    let named = match &event.logical_key {
+        Key::Named(named) => *named,
+        _ => return None,
+    };
+
+    let base = match named {
+        NamedKey::Tab => "9",
+        NamedKey::Enter => "13",
+        NamedKey::Escape => "27",
+        NamedKey::Space => "32",
+        NamedKey::Backspace => "127",
+        _ => "",
+    };
+
+    // Only control characters are encoded unless every key is reported.
+    if !kitty_encode_all && base.is_empty() {
+        return None;
+    }
+
+    let base = match (named, event.location) {
+        (NamedKey::Shift, KeyLocation::Left) => "57441",
+        (NamedKey::Control, KeyLocation::Left) => "57442",
+        (NamedKey::Alt, KeyLocation::Left) => "57443",
+        (NamedKey::Super, KeyLocation::Left) => "57444",
+        (NamedKey::Hyper, KeyLocation::Left) => "57445",
+        (NamedKey::Meta, KeyLocation::Left) => "57446",
+        (NamedKey::Shift, _) => "57447",
+        (NamedKey::Control, _) => "57448",
+        (NamedKey::Alt, _) => "57449",
+        (NamedKey::Super, _) => "57450",
+        (NamedKey::Hyper, _) => "57451",
+        (NamedKey::Meta, _) => "57452",
+        (NamedKey::CapsLock, _) => "57358",
+        (NamedKey::NumLock, _) => "57360",
+        _ => base,
+    };
+
+    // A modifier key's press state applies before the key itself, so reflect
+    // it in the modifier bits (kitty protocol recommendation).
+    let press = event.state.is_pressed();
+    match named {
+        NamedKey::Shift => set_modifier(modifiers, MOD_SHIFT, press),
+        NamedKey::Control => set_modifier(modifiers, MOD_CONTROL, press),
+        NamedKey::Alt => set_modifier(modifiers, MOD_ALT, press),
+        NamedKey::Super => set_modifier(modifiers, MOD_SUPER, press),
+        NamedKey::Hyper => set_modifier(modifiers, MOD_SUPER, press),
+        NamedKey::Meta => set_modifier(modifiers, MOD_SUPER, press),
+        _ => {},
+    }
+
+    if base.is_empty() {
+        None
+    } else {
+        Some((base.to_string(), 'u'))
+    }
+}
+
+/// Printable text keys under the kitty protocol.
+fn kitty_textual(
+    event: &KeyEvent,
+    mode: TermMode,
+    modifiers: u8,
+    kitty_encode_all: bool,
+    associated_text: Option<&str>,
+) -> Option<SequenceBase> {
+    let character = match &event.logical_key {
+        Key::Character(ch) => ch,
+        _ => return None,
+    };
+
+    if character.chars().count() != 1 {
+        // No key code is available for multi-codepoint text; only report it
+        // when every key is being encoded.
+        return if kitty_encode_all && associated_text.is_some() {
+            Some(("0".to_string(), 'u'))
+        } else {
+            None
+        };
+    }
+
+    let ch = character.chars().next().unwrap();
+    let shift = modifiers & MOD_SHIFT != 0;
+    let unshifted = if shift { ch.to_lowercase().next().unwrap() } else { ch };
+
+    let alternate_key_code = u32::from(ch);
+    let mut unicode_key_code = u32::from(unshifted);
+
+    // For shifted symbols (e.g. `!`), the key code is the unshifted base (`1`),
+    // while the alternate key is the shifted character.
+    if shift && alternate_key_code == unicode_key_code {
+        if let Key::Character(unmodded) = event.key_without_modifiers() {
+            unicode_key_code = u32::from(unmodded.chars().next().unwrap_or(unshifted));
+        }
+    }
+
+    let payload = if mode.contains(TermMode::REPORT_ALTERNATE_KEYS)
+        && alternate_key_code != unicode_key_code
+    {
+        format!("{unicode_key_code}:{alternate_key_code}")
+    } else {
+        unicode_key_code.to_string()
+    };
+
+    Some((payload, 'u'))
+}
+
+const MOD_SHIFT: u8 = 0b0000_0001;
+const MOD_ALT: u8 = 0b0000_0010;
+const MOD_CONTROL: u8 = 0b0000_0100;
+const MOD_SUPER: u8 = 0b0000_1000;
+
+fn kitty_modifiers(mods: Mods) -> u8 {
+    let mut bits = 0;
+    if mods.shift {
+        bits |= MOD_SHIFT;
+    }
+    if mods.alt {
+        bits |= MOD_ALT;
+    }
+    if mods.ctrl {
+        bits |= MOD_CONTROL;
+    }
+    if mods.super_ {
+        bits |= MOD_SUPER;
+    }
+    bits
+}
+
+fn set_modifier(bits: &mut u8, modifier: u8, on: bool) {
+    if on {
+        *bits |= modifier;
+    } else {
+        *bits &= !modifier;
+    }
+}
+
+fn kitty_active(mode: TermMode) -> bool {
+    mode.intersects(
+        TermMode::REPORT_ALL_KEYS_AS_ESC
+            | TermMode::DISAMBIGUATE_ESC_CODES
+            | TermMode::REPORT_EVENT_TYPES,
+    )
+}
+
+fn is_control_character(text: &str) -> bool {
+    let codepoint = text.bytes().next().unwrap();
+    text.len() == 1 && (codepoint < 0x20 || (0x7f..=0x9f).contains(&codepoint))
 }
 
 fn named_sequence(named: NamedKey, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {

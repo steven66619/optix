@@ -1,16 +1,19 @@
 [package]
-name = "oterminal"
+name = "optix"
 version = "0.1.0"
 edition = "2021"
 description = "A GPU-accelerated terminal emulator: kitty-grade power, modern looks."
 
 [[bin]]
-name = "oterminal"
+name = "optix"
 path = "src/main.rs"
 
 [dependencies]
 alacritty_terminal = "0.26"
 arboard = "3"
+base64 = "0.22"
+libc = "0.2"
+miniz_oxide = "0.8"
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash", "fontconfig"] }
 env_logger = "0.11"

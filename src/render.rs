@@ -130,6 +130,19 @@ pub struct ImageQuad {
     pub h: f32,
     /// Source UV rectangle `[u0, v0, u1, v1]`.
     pub uv: [f32; 4],
+    /// Tint (multiplied into the image); alpha fades the whole quad.
+    pub color: Rgba,
+}
+
+/// A textured quad for a kitty-graphics image placement.
+#[derive(Clone, Copy, Debug)]
+pub struct KittyQuad {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Texture generation key; must match an uploaded image.
+    pub gen: u64,
 }
 
 /// Accumulated draw commands for one frame.
@@ -138,6 +151,7 @@ pub struct Frame {
     pub rects: Vec<Rect>,
     pub glyphs: Vec<GlyphInstance>,
     pub image: Option<ImageQuad>,
+    pub kitty: Vec<KittyQuad>,
 }
 
 impl Frame {
@@ -150,8 +164,14 @@ impl Frame {
     pub fn glyph(&mut self, x: f32, y: f32, cache_key: CacheKey, color: Rgba) {
         self.glyphs.push(GlyphInstance { x, y, cache_key, color });
     }
-    pub fn image_quad(&mut self, x: f32, y: f32, w: f32, h: f32, uv: [f32; 4]) {
-        self.image = Some(ImageQuad { x, y, w, h, uv });
+    pub fn image_quad(&mut self, x: f32, y: f32, w: f32, h: f32, uv: [f32; 4], color: Rgba) {
+        self.image = Some(ImageQuad { x, y, w, h, uv, color });
+    }
+    pub fn kitty_quad(&mut self, x: f32, y: f32, w: f32, h: f32, gen: u64) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        self.kitty.push(KittyQuad { x, y, w, h, gen });
     }
 }
 
@@ -329,6 +349,16 @@ pub struct Renderer {
     image_tex_size: (u32, u32),
     corner_radius: f32,
     pub transparent: bool,
+    /// Cache of uploaded kitty-graphics textures, keyed by generation.
+    image_cache: HashMap<u64, GpuImage>,
+}
+
+/// A GPU texture for one kitty image placement.
+struct GpuImage {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
 }
 
 const MAX_VERTS: usize = 1 << 17;
@@ -368,7 +398,7 @@ impl Renderer {
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("oterminal device"),
+                label: Some("optix device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -576,6 +606,7 @@ impl Renderer {
             image_tex_size: (0, 0),
             corner_radius,
             transparent,
+            image_cache: HashMap::new(),
         })
     }
 
@@ -663,6 +694,54 @@ impl Renderer {
         Ok(())
     }
 
+    /// Upload (or keep) a kitty-graphics RGBA image for the given generation.
+    pub fn upload_image(&mut self, gen: u64, width: u32, height: u32, rgba: &[u8]) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        if self.image_cache.contains_key(&gen) {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("kitty image"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * width), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&Default::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("kitty image sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kitty image bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        self.image_cache.insert(gen, GpuImage { texture, bind_group, width, height });
+    }
+
+    /// Drop cached kitty textures whose generation is no longer referenced.
+    pub fn prune_images(&mut self, keep: &std::collections::HashSet<u64>) {
+        self.image_cache.retain(|gen, _| keep.contains(gen));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn push_quad(verts: &mut Vec<Vertex>, indices: &mut Vec<u32>, x: f32, y: f32, w: f32, h: f32, uv: [f32; 4], color: Rgba, is_color: f32) {
         let base = verts.len() as u32;
@@ -703,7 +782,9 @@ impl Renderer {
         if self.image_bg.is_some() {
             if let Some(img) = frame.image {
                 let uv = if self.image_tex_size.0 > 0 { self.image_uv } else { img.uv };
-                Self::push_quad(&mut verts, &mut indices, img.x, img.y, img.w, img.h, uv, Rgba::rgb(1.0, 1.0, 1.0), 0.0);
+                // is_color=1.0 so the shader samples the image texture and
+                // multiplies it by the tint (fading the whole window).
+                Self::push_quad(&mut verts, &mut indices, img.x, img.y, img.w, img.h, uv, img.color, 1.0);
                 seg_image_end = indices.len();
             }
         }
@@ -713,6 +794,27 @@ impl Renderer {
             Self::push_quad(&mut verts, &mut indices, r.x, r.y, r.w, r.h, [0.0, 0.0, 1.0, 1.0], r.color, 0.0);
         }
         let seg_white_end = indices.len();
+
+        // Segment 1.5: kitty image quads, grouped by texture generation so each
+        // run can be drawn with its own bind group.
+        let mut kitty_segments: Vec<(u64, usize, usize)> = Vec::new();
+        if !frame.kitty.is_empty() {
+            let mut sorted: Vec<&KittyQuad> = frame.kitty.iter().collect();
+            sorted.sort_by_key(|q| q.gen);
+            for quad in sorted {
+                let idx_start = indices.len();
+                Self::push_quad(&mut verts, &mut indices, quad.x, quad.y, quad.w, quad.h, [0.0, 0.0, 1.0, 1.0], Rgba::rgb(1.0, 1.0, 1.0), 1.0);
+                let idx_end = indices.len();
+                if let Some(last) = kitty_segments.last_mut() {
+                    if last.0 == quad.gen {
+                        last.2 = idx_end;
+                        continue;
+                    }
+                }
+                kitty_segments.push((quad.gen, idx_start, idx_end));
+            }
+        }
+        let seg_kitty_end = indices.len();
 
         // Segment 2: glyphs (atlas bind group).
         for g in &frame.glyphs {
@@ -780,9 +882,17 @@ impl Renderer {
                 pass.set_bind_group(0, &self.white_bg, &[]);
                 pass.draw_indexed(seg_image_end as u32..seg_white_end as u32, 0, 0..1);
             }
-            if seg_atlas_end > seg_white_end {
+            // Glyphs (text) draw before kitty quads so images render on top and
+            // occlude any text underneath them.
+            if seg_atlas_end > seg_kitty_end {
                 pass.set_bind_group(0, &self.atlas_bg, &[]);
-                pass.draw_indexed(seg_white_end as u32..seg_atlas_end as u32, 0, 0..1);
+                pass.draw_indexed(seg_kitty_end as u32..seg_atlas_end as u32, 0, 0..1);
+            }
+            for (gen, start, end) in &kitty_segments {
+                if let Some(img) = self.image_cache.get(gen) {
+                    pass.set_bind_group(0, &img.bind_group, &[]);
+                    pass.draw_indexed(*start as u32..*end as u32, 0, 0..1);
+                }
             }
         }
 

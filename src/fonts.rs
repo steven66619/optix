@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use cosmic_text::{fontdb, Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping};
@@ -24,6 +25,8 @@ pub struct Fonts {
     /// Y offset (in a row) of the text baseline.
     pub baseline: f32,
     pub family: String,
+    /// Shaped glyphs for a single terminal cell, keyed by (char, bold, italic).
+    glyph_cache: HashMap<(char, bool, bool), Vec<GlyphDraw>>,
 }
 
 impl Fonts {
@@ -61,6 +64,7 @@ impl Fonts {
             cell_h: 0.0,
             baseline: 0.0,
             family: resolved,
+            glyph_cache: HashMap::new(),
         };
         fonts.remeasure();
         Ok(fonts)
@@ -69,6 +73,7 @@ impl Fonts {
     /// Recompute metrics for a new font size (in points, unscaled by dpi).
     pub fn set_font_size(&mut self, font_size: f32, dpi_scale: f32) {
         self.font_size_px = font_size * (96.0 / 72.0) * dpi_scale;
+        self.glyph_cache.clear();
         self.remeasure();
     }
 
@@ -102,6 +107,44 @@ impl Fonts {
             .next()
             .map(|run| run.line_y)
             .unwrap_or(line_y);
+    }
+
+    /// Layout one terminal cell; returns glyphs positioned relative to the cell's
+    /// top-left corner. Shaping is done once per distinct (char, bold, italic).
+    pub fn layout_cell(&mut self, c: char, bold: bool, italic: bool) -> &[GlyphDraw] {
+        let key = (c, bold, italic);
+        if !self.glyph_cache.contains_key(&key) {
+            let glyphs = self.shape_cell(c, bold, italic);
+            self.glyph_cache.insert(key, glyphs);
+        }
+        &self.glyph_cache[&key]
+    }
+
+    fn shape_cell(&mut self, c: char, bold: bool, italic: bool) -> Vec<GlyphDraw> {
+        let mut attrs = Attrs::new().family(Family::Name(&self.family));
+        if bold {
+            attrs = attrs.weight(cosmic_text::fontdb::Weight::BOLD);
+        }
+        if italic {
+            attrs = attrs.style(cosmic_text::fontdb::Style::Italic);
+        }
+        self.buffer.set_text(&c.to_string(), &attrs, Shaping::Advanced, None);
+        self.buffer.set_size(None, None);
+        self.buffer.shape_until_scroll(&mut self.font_system, true);
+
+        let baseline = self.baseline;
+        let mut out = Vec::new();
+        for run in self.buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let phys = glyph.physical((0.0, 0.0), 1.0);
+                out.push(GlyphDraw {
+                    cache_key: phys.cache_key,
+                    x: phys.x as f32,
+                    y: baseline + phys.y as f32,
+                });
+            }
+        }
+        out
     }
 
     /// Layout one line of text; returns glyphs positioned relative to the line's

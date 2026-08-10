@@ -40,8 +40,8 @@ impl Dimensions for PaneSize {
 
 fn setup() -> (Arc<FairMutex<Term<PaneProxy>>>, alacritty_terminal::event_loop::EventLoopSender) {
     let (tx, _rx) = mpsc::channel::<PaneEvent>();
-    let proxy_a = PaneProxy { pane_id: 0, tx: tx.clone() };
-    let proxy_b = PaneProxy { pane_id: 0, tx };
+    let proxy_a = PaneProxy { pane_id: 0, tx: tx.clone(), el_wakeup: None };
+    let proxy_b = PaneProxy { pane_id: 0, tx, el_wakeup: None };
     let term_config = TermConfig { kitty_keyboard: false, ..TermConfig::default() };
     let dims = PaneSize { columns: 95, screen_lines: 46 };
     let term = Arc::new(FairMutex::new(Term::new(term_config, &dims, proxy_a)));

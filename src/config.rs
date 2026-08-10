@@ -75,7 +75,7 @@ pub struct Window {
 impl Default for Window {
     fn default() -> Self {
         Self {
-            opacity: 0.97,
+            opacity: 0.8,
             transparent: false,
             background_image: None,
             corner_radius: 12.0,
@@ -208,31 +208,33 @@ impl Config {
     /// Load configuration from `~/.config/optix/config.toml` merged with defaults.
     pub fn load() -> Self {
         let path = config_path();
-        let mut cfg = match fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str::<TomlConfig>(&text) {
-                Ok(cfg) => cfg.into_config(),
-                Err(err) => {
-                    log::error!("Failed to parse {}: {err}; using defaults", path.display());
-                    Self::default_config()
-                },
-            },
-            Err(_) => {
-                let default = Self::default_config();
-                if let Err(err) = default.write_example_config(&path) {
-                    log::warn!("Failed to write default config to {}: {err}", path.display());
-                }
-                default
-            },
-        };
-
-        // Merge any keybindings found in the config file over the defaults.
-        if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(toml_cfg) = toml::from_str::<TomlConfig>(&text) {
-                cfg.keybindings.extend(toml_cfg.keybindings);
+        if !path.exists() {
+            let default = Self::default_config();
+            if let Err(err) = default.write_example_config(&path) {
+                log::warn!("Failed to write default config to {}: {err}", path.display());
             }
+            return default;
         }
+        match Self::try_load() {
+            Some(cfg) => cfg,
+            None => {
+                log::error!("Failed to parse {}; using defaults", path.display());
+                Self::default_config()
+            },
+        }
+    }
 
-        cfg
+    /// Read and parse the config file, returning `None` if it is missing or
+    /// malformed (used by the live-reload path to keep the old settings until
+    /// the file is valid again).
+    pub fn try_load() -> Option<Self> {
+        let path = config_path();
+        let text = fs::read_to_string(&path).ok()?;
+        let toml_cfg = toml::from_str::<TomlConfig>(&text).ok()?;
+        let keybindings = toml_cfg.keybindings.clone();
+        let mut cfg = toml_cfg.into_config();
+        cfg.keybindings.extend(keybindings);
+        Some(cfg)
     }
 
     /// Write a commented example config to `path` (used on first launch).
@@ -361,7 +363,7 @@ padding_x = 12.0
 padding_y = 10.0
 
 [window]
-opacity = 0.97                # 0.0 ..= 1.0
+opacity = 0.8                 # 0.0 ..= 1.0
 transparent = false           # true = ARGB window so picom shows the wallpaper through
                               # (needs a compositor running; combine with opacity < 1.0)
 # background_image = "/path/to/image.png"

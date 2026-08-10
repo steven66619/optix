@@ -369,6 +369,7 @@ impl Renderer {
         size: PhysicalSize<u32>,
         dpi_scale: f32,
         corner_radius: f32,
+        transparent: bool,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         // SAFETY: the window is owned by the application alongside this renderer,
@@ -415,8 +416,21 @@ impl Renderer {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
-        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-            wgpu::CompositeAlphaMode::PostMultiplied
+        // Honor the config's transparency request. On X11 the compositor
+        // (picom) only sees the wallpaper through an alpha-capable surface, so
+        // when transparency is requested we must pick a non-opaque alpha mode
+        // rather than whatever the driver happens to advertise first.
+        let alpha_mode = if transparent {
+            if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+                wgpu::CompositeAlphaMode::PostMultiplied
+            } else {
+                log::warn!("transparency requested but no alpha-capable surface mode is available");
+                wgpu::CompositeAlphaMode::Auto
+            }
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
         } else {
             wgpu::CompositeAlphaMode::Auto
         };
@@ -440,7 +454,6 @@ impl Renderer {
 
         let transparent = alpha_mode != wgpu::CompositeAlphaMode::Auto
             && alpha_mode != wgpu::CompositeAlphaMode::Opaque;
-
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sprite uniforms"),
             contents: bytemuck::bytes_of(&Uniforms { screen: [size.width.max(1) as f32, size.height.max(1) as f32], corner: corner_radius, _pad: 0.0 }),
@@ -616,15 +629,21 @@ impl Renderer {
         self.config.width = size.width.max(1);
         self.config.height = size.height.max(1);
         self.surface.configure(&self.device, &self.config);
+        self.write_uniforms();
+    }
+
+    pub fn set_corner_radius(&mut self, radius: f32) {
+        self.corner_radius = radius;
+        self.write_uniforms();
+    }
+
+    /// Push the current screen size + corner radius to the GPU uniforms.
+    fn write_uniforms(&mut self) {
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
             bytemuck::bytes_of(&Uniforms { screen: [self.config.width as f32, self.config.height as f32], corner: self.corner_radius, _pad: 0.0 }),
         );
-    }
-
-    pub fn set_corner_radius(&mut self, radius: f32) {
-        self.corner_radius = radius;
     }
 
     /// Whether a background image is loaded.
@@ -692,6 +711,12 @@ impl Renderer {
         self.image_uv = [u0, v0, u1, v1];
         self.image_tex_size = (w, h);
         Ok(())
+    }
+
+    /// Drop the loaded background image (falls back to the theme gradient/flat color).
+    pub fn clear_background_image(&mut self) {
+        self.image_bg = None;
+        self.image_tex_size = (0, 0);
     }
 
     /// Upload (or keep) a kitty-graphics RGBA image for the given generation.

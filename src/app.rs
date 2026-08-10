@@ -65,6 +65,8 @@ pub struct OptixApp {
     quit: bool,
     clipboard: Option<arboard::Clipboard>,
     default_title: String,
+    /// Last-seen mtime of the config file, for live reload.
+    config_mtime: Option<std::time::SystemTime>,
 }
 
 impl OptixApp {
@@ -76,6 +78,9 @@ impl OptixApp {
     ) -> Self {
         let palette = Palette::from_theme(&config.theme);
         let base_font_size = config.font.size;
+        let config_mtime = std::fs::metadata(crate::config::config_path())
+            .and_then(|m| m.modified())
+            .ok();
         Self {
             palette,
             base_font_size,
@@ -100,6 +105,7 @@ impl OptixApp {
             renderer: None,
             fonts: None,
             config,
+            config_mtime,
         }
     }
 
@@ -577,6 +583,103 @@ impl OptixApp {
         }
     }
 
+    /// Re-read the config file if its mtime changed since we last looked.
+    /// Returns true if settings were re-applied (caller should redraw).
+    fn reload_config_if_changed(&mut self) -> bool {
+        // Nothing to apply live until the window + renderer exist.
+        if self.window.is_none() {
+            return false;
+        }
+        let mtime = std::fs::metadata(crate::config::config_path())
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime.is_some() && mtime == self.config_mtime {
+            return false;
+        }
+        self.config_mtime = mtime;
+        // If the file is currently malformed (mid-save), keep the old settings;
+        // the watcher will re-trigger on the next write.
+        let Some(new_cfg) = Config::try_load() else { return false };
+        log::info!("config changed; applying live reload");
+        self.apply_config(new_cfg);
+        true
+    }
+
+    /// Apply a freshly loaded config to live, running state.
+    fn apply_config(&mut self, new_cfg: Config) {
+        // Capture old values needed for comparison before swapping.
+        let old_family = self.config.font.family.clone();
+        let old_base_size = self.base_font_size;
+        let old_pad = (self.config.font.padding_x, self.config.font.padding_y);
+        let old_corner = self.config.window.corner_radius;
+        let old_img = self.config.window.background_image.clone();
+        let old_title = self.default_title.clone();
+        let old_size = (self.config.window.width, self.config.window.height);
+        let old_transparent = self.config.window.transparent;
+
+        // Colors are re-resolved from the new theme; the terminal palette is
+        // re-derived so every pane immediately uses the new scheme.
+        self.palette = Palette::from_theme(&new_cfg.theme);
+        self.config = new_cfg;
+
+        let font_changed = self.config.font.family != old_family
+            || self.config.font.size != old_base_size;
+        let pad_changed = (self.config.font.padding_x, self.config.font.padding_y) != old_pad;
+        if font_changed {
+            // Rebuild the font stack at the current (possibly zoomed) size so a
+            // family/size edit takes effect immediately. Keep zoom on failure.
+            let size = if self.config.font.size == old_base_size { self.font_size } else { self.config.font.size };
+            match Fonts::new(&self.config.font.family, size, self.dpi_scale) {
+                Ok(f) => {
+                    self.fonts = Some(f);
+                    self.base_font_size = self.config.font.size;
+                    if self.config.font.size != old_base_size {
+                        self.font_size = self.config.font.size;
+                    }
+                },
+                Err(err) => log::warn!("font reload failed: {err}"),
+            }
+        }
+        if font_changed || pad_changed {
+            self.recompute_pane_sizes();
+        }
+
+        if let Some(renderer) = &mut self.renderer {
+            if self.config.window.corner_radius != old_corner {
+                renderer.set_corner_radius(self.config.window.corner_radius);
+            }
+            let new_img = self.config.window.background_image.clone();
+            if new_img != old_img {
+                match &new_img {
+                    Some(path) => {
+                        if let Err(err) = renderer.load_background_image(path) {
+                            log::warn!("{err}");
+                        }
+                    },
+                    None => renderer.clear_background_image(),
+                }
+            }
+        }
+
+        // Window-level settings that can be applied without recreating the window.
+        if self.config.window.title != old_title {
+            self.default_title = self.config.window.title.clone();
+            if self.window().title() == old_title {
+                self.window().set_title(&self.default_title);
+            }
+        }
+        if (self.config.window.width, self.config.window.height) != old_size {
+            let size = winit::dpi::PhysicalSize::new(
+                self.config.window.width.max(1),
+                self.config.window.height.max(1),
+            );
+            let _ = self.window().request_inner_size(size);
+        }
+        if self.config.window.transparent != old_transparent {
+            log::warn!("changing `window.transparent` requires a restart");
+        }
+    }
+
     fn handle_events(&mut self) -> bool {
         let mut dirty = false;
         let mut exited: Option<PaneId> = None;
@@ -1025,7 +1128,7 @@ impl ApplicationHandler for OptixApp {
         self.dpi_scale = dpi;
         self.default_title = window.title();
 
-        let mut renderer = match Renderer::new(&window, size, dpi, self.config.window.corner_radius) {
+        let mut renderer = match Renderer::new(&window, size, dpi, self.config.window.corner_radius, self.config.window.transparent) {
             Ok(r) => r,
             Err(err) => {
                 log::error!("failed to initialize renderer: {err}");
@@ -1123,7 +1226,9 @@ impl ApplicationHandler for OptixApp {
             event_loop.exit();
             return;
         }
-        if self.handle_events() {
+        // Live reload: pick up config.toml edits (colors, fonts, window opts).
+        let reloaded = self.reload_config_if_changed();
+        if self.handle_events() || reloaded {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }

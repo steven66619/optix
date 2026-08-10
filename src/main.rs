@@ -20,6 +20,7 @@ mod terminal;
 mod repro;
 
 use std::sync::mpsc;
+use std::time::Duration;
 
 use winit::event_loop::EventLoop;
 
@@ -42,9 +43,30 @@ fn main() {
     };
     let el_wakeup = event_loop.create_proxy();
 
+    // Watch ~/.config/optix/config.toml and wake the event loop whenever it
+    // changes so the running app can live-reload settings (colors, fonts, ...).
+    spawn_config_watcher(el_wakeup.clone());
+
     let mut app = OptixApp::new(config, event_tx, event_rx, el_wakeup);
 
     if let Err(err) = event_loop.run_app(&mut app) {
         log::error!("event loop error: {err}");
     }
+}
+
+/// Poll the config file's mtime and wake the event loop when it changes.
+fn spawn_config_watcher(wakeup: winit::event_loop::EventLoopProxy<()>) {
+    std::thread::spawn(move || {
+        let path = config::config_path();
+        let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if now.is_some() && now != last {
+                // Ignore a broken proxy: the loop shutting down just ends the poll.
+                let _ = wakeup.send_event(());
+                last = now;
+            }
+        }
+    });
 }

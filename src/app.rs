@@ -40,6 +40,18 @@ enum SearchAction {
     Push(String),
 }
 
+/// What to do with the in-progress `/command` buffer after a key press.
+enum CommandKey {
+    /// Buffer updated; keep composing.
+    Keep,
+    /// Enter: run the command (or flush it to the shell).
+    Execute,
+    /// Escape/backspace-to-empty: drop the buffer, send nothing.
+    Cancel,
+    /// Any other key: send what was typed to the shell, then process normally.
+    Flush,
+}
+
 /// The terminal application.
 pub struct OptixApp {
     config: Config,
@@ -67,6 +79,12 @@ pub struct OptixApp {
     default_title: String,
     /// Last-seen mtime of the config file, for live reload.
     config_mtime: Option<std::time::SystemTime>,
+    /// In-progress `/command` line (only composed while `Some`).
+    command: Option<String>,
+    /// Heuristic: the next key press starts a fresh shell line.
+    line_start: bool,
+    /// Transient feedback shown after running a command, e.g. "Unknown theme".
+    command_message: Option<(String, Instant)>,
 }
 
 impl OptixApp {
@@ -106,6 +124,9 @@ impl OptixApp {
             fonts: None,
             config,
             config_mtime,
+            command: None,
+            line_start: true,
+            command_message: None,
         }
     }
 
@@ -416,6 +437,52 @@ impl OptixApp {
             return;
         }
 
+        // Start composing an internal `/command` when `/` begins a fresh line.
+        if self.command.is_none()
+            && command_trigger(self.mods, self.line_start, event.state, event.repeat, &event.logical_key)
+        {
+            self.command = Some("/".to_string());
+            self.line_start = false;
+            self.window().request_redraw();
+            return;
+        }
+
+        // While composing, keys edit the buffer instead of reaching the shell.
+        if let Some(mut cmd) = self.command.take() {
+            match self.on_command_key(&mut cmd, &event) {
+                CommandKey::Keep => {
+                    self.command = Some(cmd);
+                    self.window().request_redraw();
+                    return;
+                },
+                CommandKey::Execute => {
+                    self.line_start = true;
+                    self.command_message = None;
+                    if cmd.trim_start().starts_with("/theme") {
+                        self.run_theme_command(&cmd);
+                    } else {
+                        // Not an internal command: hand the whole line to the shell.
+                        self.write_to_shell(&cmd);
+                        self.write_to_shell("\r");
+                    }
+                    self.window().request_redraw();
+                    return;
+                },
+                CommandKey::Cancel => {
+                    self.line_start = false;
+                    self.window().request_redraw();
+                    return;
+                },
+                CommandKey::Flush => {
+                    // An unexpected key (arrows, shortcuts, ...) ended the
+                    // command: let the shell see what was typed so far, then
+                    // process this key normally below.
+                    self.line_start = false;
+                    self.write_to_shell(&cmd);
+                },
+            }
+        }
+
         // Resolve keybindings once per physical press; ignore auto-repeat so
         // actions like paste do not fire on key release or while held.
         if event.state == ElementState::Pressed && !event.repeat {
@@ -457,6 +524,8 @@ impl OptixApp {
             if let Some(pane) = self.focused_pane() {
                 pane.write(&bytes);
             }
+            // Track line-start so `/` only opens a command at a fresh line.
+            self.line_start = bytes.contains(&b'\r');
         }
     }
 
@@ -506,6 +575,46 @@ impl OptixApp {
             if let Some(pane) = self.focused_pane() {
                 pane.scroll(Scroll::Delta(lines));
             }
+        }
+    }
+
+    /// Edit an in-progress `/command` buffer; returns what to do with it.
+    fn on_command_key(&self, cmd: &mut String, event: &KeyEvent) -> CommandKey {
+        command_edit(cmd, self.mods, event.state, event.repeat, &event.logical_key)
+    }
+
+    /// Execute a `/theme <name>` command; no argument lists available themes.
+    fn run_theme_command(&mut self, line: &str) {
+        let args: Vec<&str> = line.split_whitespace().collect();
+        if args.len() < 2 {
+            let names = crate::themes::names();
+            self.command_message = Some((
+                format!(
+                    "themes: {} — try /theme <name>, or drop <name>.toml in ~/.config/optix/themes/",
+                    names.join(", ")
+                ),
+                Instant::now(),
+            ));
+            return;
+        }
+        let name = args[1];
+        match crate::themes::by_name(name) {
+            Some(theme) => {
+                self.palette = Palette::from_theme(&theme);
+                log::info!("theme set to `{name}`");
+                self.command_message = Some((format!("theme set to {name}"), Instant::now()));
+            },
+            None => {
+                self.command_message =
+                    Some((format!("unknown theme `{name}`"), Instant::now()));
+            },
+        }
+    }
+
+    /// Write raw text into the focused pane's PTY (as if typed).
+    fn write_to_shell(&mut self, text: &str) {
+        if let Some(pane) = self.focused_pane() {
+            pane.write_str(text);
         }
     }
 
@@ -875,6 +984,22 @@ impl OptixApp {
             }
         }
 
+        // In-progress `/command` and its transient result message.
+        if let Some(cmd) = &self.command {
+            if let Some((_, pane_rect)) = rects.iter().find(|(id, _)| *id == focused_id) {
+                draw_command_overlay(&mut frame, fonts, &format!("{cmd}█"), theme, pane_rect, 30.0 * self.dpi_scale);
+            }
+        }
+        if let Some((msg, when)) = &self.command_message {
+            if when.elapsed() < Duration::from_secs(4) {
+                if let Some((_, pane_rect)) = rects.iter().find(|(id, _)| *id == focused_id) {
+                    draw_command_overlay(&mut frame, fonts, msg, theme, pane_rect, 30.0 * self.dpi_scale);
+                }
+            } else {
+                self.command_message = None;
+            }
+        }
+
         if let Some(flash) = self.bell_flash {
             if flash.elapsed() < Duration::from_millis(250) {
                 frame.rect(0.0, 0.0, w, h, theme.bell.with_alpha(0.12));
@@ -905,8 +1030,20 @@ fn draw_search_overlay(
 ) {
     let Some(search) = search else { return };
     let text = format!("Search: {}█", search.query);
+    draw_command_overlay(frame, fonts, &text, theme, pane_rect, height);
+}
+
+/// Draw a text bar across the top of the focused pane (search or `/command`).
+fn draw_command_overlay(
+    frame: &mut Frame,
+    fonts: &mut Fonts,
+    text: &str,
+    theme: &ParsedTheme,
+    pane_rect: &Rect,
+    height: f32,
+) {
     frame.rect(pane_rect.x, pane_rect.y, pane_rect.w, height, theme.search_background);
-    let glyphs = fonts.layout_paragraph(&text, Some(pane_rect.w - 20.0), false, height * 0.5);
+    let glyphs = fonts.layout_paragraph(text, Some(pane_rect.w - 20.0), false, height * 0.5);
     for g in glyphs {
         frame.glyph(pane_rect.x + 10.0 + g.x, pane_rect.y + g.y, g.cache_key, theme.search_foreground);
     }
@@ -1233,5 +1370,119 @@ impl ApplicationHandler for OptixApp {
                 window.request_redraw();
             }
         }
+    }
+}
+
+/// Pure `CommandKey` edit step, factored out for unit testing.
+fn command_edit(cmd: &mut String, mods: Mods, state: ElementState, repeat: bool, key: &Key) -> CommandKey {
+    if state != ElementState::Pressed {
+        return CommandKey::Keep;
+    }
+    match key {
+        Key::Named(NamedKey::Enter) => CommandKey::Execute,
+        Key::Named(NamedKey::Escape) => CommandKey::Cancel,
+        Key::Named(NamedKey::Backspace) => {
+            cmd.pop();
+            if cmd.is_empty() {
+                CommandKey::Cancel
+            } else {
+                CommandKey::Keep
+            }
+        },
+        Key::Character(ch) if !repeat => {
+            if mods.is_empty() {
+                cmd.push_str(ch);
+                CommandKey::Keep
+            } else {
+                CommandKey::Flush
+            }
+        },
+        _ => CommandKey::Flush,
+    }
+}
+
+/// Whether a key press should open a `/command` (a plain `/` at line start).
+fn command_trigger(mods: Mods, line_start: bool, state: ElementState, repeat: bool, key: &Key) -> bool {
+    line_start
+        && state == ElementState::Pressed
+        && !repeat
+        && mods.is_empty()
+        && matches!(key, Key::Character(ch) if ch == "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::Key;
+
+    fn no_mods() -> Mods {
+        Mods { ctrl: false, shift: false, alt: false, super_: false }
+    }
+
+    #[test]
+    fn trigger_only_on_plain_slash_at_line_start() {
+        let pressed = ElementState::Pressed;
+        let slash = Key::Character("/".into());
+        assert!(command_trigger(no_mods(), true, pressed, false, &slash));
+        assert!(!command_trigger(no_mods(), false, pressed, false, &slash));
+        assert!(!command_trigger(no_mods(), true, ElementState::Released, false, &slash));
+        assert!(!command_trigger(no_mods(), true, pressed, true, &slash));
+
+        let ctrl = Mods { ctrl: true, shift: false, alt: false, super_: false };
+        assert!(!command_trigger(ctrl, true, pressed, false, &slash));
+
+        let other = Key::Character("x".into());
+        assert!(!command_trigger(no_mods(), true, pressed, false, &other));
+    }
+
+    #[test]
+    fn composing_builds_the_command() {
+        let mut cmd = "/".to_string();
+        for c in "theme gruvbox".chars() {
+            let key = Key::Character(c.to_string().into());
+            assert!(matches!(command_edit(&mut cmd, no_mods(), ElementState::Pressed, false, &key), CommandKey::Keep));
+        }
+        assert_eq!(cmd, "/theme gruvbox");
+    }
+
+    #[test]
+    fn enter_executes_escape_cancels() {
+        let mut cmd = "/theme dracula".to_string();
+        let enter = Key::Named(NamedKey::Enter);
+        assert!(matches!(command_edit(&mut cmd, no_mods(), ElementState::Pressed, false, &enter), CommandKey::Execute));
+
+        let mut cmd2 = "/theme".to_string();
+        let esc = Key::Named(NamedKey::Escape);
+        assert!(matches!(command_edit(&mut cmd2, no_mods(), ElementState::Pressed, false, &esc), CommandKey::Cancel));
+        assert_eq!(cmd2, "/theme");
+    }
+
+    #[test]
+    fn backspace_edits_and_empty_cancels() {
+        let bs = Key::Named(NamedKey::Backspace);
+        let pressed = ElementState::Pressed;
+
+        let mut cmd = "/th".to_string();
+        assert!(matches!(command_edit(&mut cmd, no_mods(), pressed, false, &bs), CommandKey::Keep));
+        assert_eq!(cmd, "/t");
+
+        let mut cmd = "/t".to_string();
+        assert!(matches!(command_edit(&mut cmd, no_mods(), pressed, false, &bs), CommandKey::Keep));
+        assert_eq!(cmd, "/");
+
+        let mut cmd = "/".to_string();
+        assert!(matches!(command_edit(&mut cmd, no_mods(), pressed, false, &bs), CommandKey::Cancel));
+    }
+
+    #[test]
+    fn modified_or_other_keys_flush() {
+        let arrow = Key::Named(NamedKey::ArrowUp);
+        let mut cmd = "/theme".to_string();
+        assert!(matches!(command_edit(&mut cmd, no_mods(), ElementState::Pressed, false, &arrow), CommandKey::Flush));
+
+        let ctrl_c = Key::Character("c".into());
+        let ctrl = Mods { ctrl: true, shift: false, alt: false, super_: false };
+        let mut cmd2 = "/theme".to_string();
+        assert!(matches!(command_edit(&mut cmd2, ctrl, ElementState::Pressed, false, &ctrl_c), CommandKey::Flush));
     }
 }

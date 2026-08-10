@@ -25,7 +25,7 @@ impl Mods {
         }
     }
 
-    fn is_empty(self) -> bool {
+    pub fn is_empty(self) -> bool {
         !self.ctrl && !self.shift && !self.alt && !self.super_
     }
 }

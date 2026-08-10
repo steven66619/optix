@@ -247,15 +247,28 @@ impl Config {
 }
 
 pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// Directory holding all optix config files: `~/.config/optix`.
+pub fn config_dir() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")).unwrap_or_default()
         });
-    base.join(DEFAULT_CONFIG_DIR).join("config.toml")
+    base.join(DEFAULT_CONFIG_DIR)
 }
 
 impl ParsedTheme {
+    /// Parse a theme from a TOML string containing a `[theme]` section (the
+    /// same layout as `config.toml`, and what `~/.config/optix/themes/*.toml`
+    /// files use). Returns `None` if the file has no valid `[theme]` table.
+    pub fn from_toml(raw: &str) -> Option<Self> {
+        let cfg: TomlConfig = toml::from_str(raw).ok()?;
+        cfg.theme.map(|theme| ParsedTheme::from_raw(&theme))
+    }
+
     pub fn from_raw(raw: &Theme) -> Self {
         let dim_default = |i: usize| {
             let base = Rgba::from_hex(&raw.normal[i]).unwrap_or_default();

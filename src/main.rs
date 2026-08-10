@@ -15,6 +15,7 @@ mod palette;
 mod pty_io;
 mod render;
 mod terminal;
+mod themes;
 
 #[cfg(test)]
 mod repro;

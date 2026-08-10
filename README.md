@@ -4,8 +4,6 @@ A GPU-accelerated terminal emulator written in Rust — kitty-grade power with
 modern looks. Optix uses `wgpu` for rendering, `alacritty_terminal` for the
 terminal core, and `cosmic-text` for high-quality font shaping.
 
-![category: terminal-emulator]
-
 ## Features
 
 - **GPU-accelerated rendering** — `wgpu` (Vulkan/Metal/DX12) with a fallback
@@ -187,4 +185,4 @@ src/
 
 ## License
 
-MIT (add your license file here if you choose a different one).
+MIT — see [LICENSE](./LICENSE).

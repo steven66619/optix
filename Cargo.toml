@@ -3,6 +3,7 @@ name = "optix"
 version = "0.1.0"
 edition = "2021"
 description = "A GPU-accelerated terminal emulator: kitty-grade power, modern looks."
+license = "MIT"
 
 [lib]
 name = "optix"

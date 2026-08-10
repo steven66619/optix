@@ -310,6 +310,10 @@ fn load_minimal_font_database(family: &str) -> fontdb::Database {
         ("colrv1", ""), // Noto Color Emoji
         ("liberationmono", ""), // metric-compatible generic mono
         ("opensymbol", ""), // misc symbols
+        ("freefont", ""), // GNU FreeFont family dir
+        ("freesans", ""), // GNU FreeFont Sans: geometric shapes, dingbats
+        ("freeserif", ""), // GNU FreeFont Serif: misc symbols (e.g. U+26F0)
+        ("freemono", ""), // GNU FreeFont Mono: misc symbols
     ];
 
     let mut db = fontdb::Database::new();

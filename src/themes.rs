@@ -1,4 +1,5 @@
-//! Theme presets selectable at runtime with `/theme <name>`.
+//! Theme presets selectable at runtime with `/theme <name>` or by typing
+//! `theme <name>` directly at a shell prompt (see the `magic` module).
 //!
 //! Built-in palettes live here as TOML snippets matching the `[theme]` config
 //! section. Users can drop their own `<name>.toml` files (same `[theme]` layout)

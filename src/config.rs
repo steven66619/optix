@@ -18,6 +18,10 @@ pub struct Config {
     pub working_directory: Option<PathBuf>,
     /// `"ctrl+shift+t"` -> action name.
     pub keybindings: HashMap<String, String>,
+    /// Whether shell lines like `theme <name>` are intercepted by the terminal.
+    pub magic_enabled: bool,
+    /// Whether the `optix-msg` Unix-socket server is running.
+    pub ipc_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +122,35 @@ pub struct Gradient {
     pub bottom: String,
 }
 
+/// Config for magic shell-level commands (`theme <name>` etc.).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MagicCfg {
+    /// Intercept magic commands instead of forwarding them to the shell.
+    pub enabled: bool,
+}
+
+impl Default for MagicCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Config for the `optix-msg` IPC server.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IpcCfg {
+    /// Serve commands over a Unix socket so `optix-msg theme ayu` can drive a
+    /// running terminal (see `~/.config/optix/ipc.sock`).
+    pub enabled: bool,
+}
+
+impl Default for IpcCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         // Catppuccin Mocha based default palette.
@@ -202,6 +235,8 @@ impl Config {
             shell: None,
             working_directory: None,
             keybindings: default_keybindings(),
+            magic_enabled: true,
+            ipc_enabled: true,
         }
     }
 
@@ -316,6 +351,8 @@ struct TomlConfig {
     shell: Option<String>,
     working_directory: Option<String>,
     keybindings: HashMap<String, String>,
+    magic: Option<MagicCfg>,
+    ipc: Option<IpcCfg>,
 }
 
 impl TomlConfig {
@@ -328,6 +365,8 @@ impl TomlConfig {
             shell: self.shell,
             working_directory: self.working_directory.map(PathBuf::from),
             keybindings: defaults.keybindings,
+            magic_enabled: self.magic.map(|m| m.enabled).unwrap_or(true),
+            ipc_enabled: self.ipc.map(|i| i.enabled).unwrap_or(true),
         }
     }
 }
@@ -345,6 +384,7 @@ fn default_keybindings() -> HashMap<String, String> {
         ("ctrl+alt+right", "focus_pane_right"),
         ("ctrl+shift+f", "search"),
         ("ctrl+shift+f2", "search"),
+        ("ctrl+shift+p", "command"),
         ("ctrl+shift+enter", "search_next"),
         ("ctrl+shift+g", "search_next"),
         ("ctrl+shift+h", "search_prev"),
@@ -414,6 +454,22 @@ bell = "#f9e2af"
 top = "#2b2b40"
 bottom = "#16161d"
 
+# Magic commands: lines typed at a shell prompt that optix handles itself
+# instead of forwarding to the shell. With this enabled, typing
+#   theme ayu          switch to the "ayu" theme (no shell error, no /theme)
+#   theme              list the available themes
+# at a shell prompt changes the theme without the shell trying to run a
+# `theme` program.
+[magic]
+enabled = true
+
+# IPC: serve commands over a Unix socket so external tools can drive a running
+# terminal, e.g. `optix-msg theme ayu`, `optix-msg themes`, `optix-msg ping`.
+# This is the reliable way to switch themes on the fly (no /theme overlay, no
+# shell cooperation needed).
+[ipc]
+enabled = true
+
 # Keybindings: "mods+key" = "action"
 # mods: ctrl, shift, alt, super (any order, separated by +)
 # Actions:
@@ -423,6 +479,7 @@ bottom = "#16161d"
 #   search search_next search_prev
 #   copy paste
 #   font_increase font_decrease font_reset
+#   command          open the /command line (e.g. "/theme ayu")
 #   quit
 [keybindings]
 "ctrl+shift+e" = "split_right"
@@ -436,6 +493,7 @@ bottom = "#16161d"
 "ctrl+alt+right" = "focus_pane_right"
 "ctrl+shift+f" = "search"
 "ctrl+shift+enter" = "search_next"
+"ctrl+shift+p" = "command"   # open the /command line, e.g. "/theme ayu"
 "ctrl+shift+up" = "scroll_up"
 "ctrl+shift+down" = "scroll_down"
 "ctrl+shift+pageup" = "page_up"
@@ -449,3 +507,56 @@ bottom = "#16161d"
 "ctrl+0" = "font_reset"
 "ctrl+shift+q" = "quit"
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_keybindings_include_command_action() {
+        let bindings = default_keybindings();
+        assert_eq!(bindings.get("ctrl+shift+p").map(String::as_str), Some("command"));
+        // The `command` action opens the overlay that powers `/theme`.
+        assert_eq!(bindings.get("ctrl+shift+f").map(String::as_str), Some("search"));
+    }
+
+    #[test]
+    fn example_config_parses_and_keeps_command_binding() {
+        let cfg: TomlConfig = toml::from_str(EXAMPLE_CONFIG).expect("example config is valid TOML");
+        let keybindings = cfg.keybindings;
+        assert_eq!(keybindings.get("ctrl+shift+p").map(String::as_str), Some("command"));
+        assert_eq!(cfg.magic.map(|m| m.enabled), Some(true));
+    }
+
+    #[test]
+    fn magic_defaults_to_enabled_when_absent() {
+        let cfg: TomlConfig = toml::from_str("[window]\nwidth = 640").unwrap();
+        assert!(cfg.magic.is_none());
+        let config = cfg.into_config();
+        assert!(config.magic_enabled);
+    }
+
+    #[test]
+    fn magic_can_be_disabled() {
+        let cfg: TomlConfig =
+            toml::from_str("[magic]\nenabled = false").expect("valid TOML");
+        let config = cfg.into_config();
+        assert!(!config.magic_enabled);
+    }
+
+    #[test]
+    fn ipc_defaults_to_enabled_when_absent() {
+        let cfg: TomlConfig = toml::from_str("[window]\nwidth = 640").unwrap();
+        assert!(cfg.ipc.is_none());
+        let config = cfg.into_config();
+        assert!(config.ipc_enabled);
+    }
+
+    #[test]
+    fn ipc_can_be_disabled() {
+        let cfg: TomlConfig =
+            toml::from_str("[ipc]\nenabled = false").expect("valid TOML");
+        let config = cfg.into_config();
+        assert!(!config.ipc_enabled);
+    }
+}

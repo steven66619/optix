@@ -1,0 +1,100 @@
+# Optix configuration.
+# This file is regenerated on first launch; all fields are optional.
+
+[font]
+family = "JetBrainsMono NF"   # any fontconfig family
+size = 12.0
+padding_x = 12.0
+padding_y = 10.0
+
+[window]
+opacity = 0.8                 # 0.0 ..= 1.0
+transparent = false           # true = ARGB window so picom shows the wallpaper through
+                              # (needs a compositor running; combine with opacity < 1.0)
+# background_image = "/path/to/image.png"
+corner_radius = 12.0
+glow = true
+width = 1080
+height = 680
+title = "Optix"
+
+[theme]
+background = "#1e1e2e"
+foreground = "#cdd6f4"
+cursor = "#f5e0dc"
+# cursor_text = "#1e1e2e"
+selection_background = "#585b70"
+# selection_foreground = "#cdd6f4"
+
+# ANSI 16 palette
+normal = ["#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de"]
+bright = ["#585b70", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8"]
+# dim = ["#313244", "#e78284", "#a6d189", "#e5c890", "#8caaee", "#f4b8e4", "#81c8be", "#a5adce"]
+
+split_border = "#45475a"
+split_active = "#89b4fa"
+
+search_background = "#313244"
+search_foreground = "#cdd6f4"
+search_match_background = "#89b4fa"
+# search_match_foreground = "#1e1e2e"
+bell = "#f9e2af"
+
+# Vertical gradient painted behind the terminal when no image is set.
+# Remove this section for a flat background.
+[theme.background_gradient]
+top = "#2b2b40"
+bottom = "#16161d"
+
+# Magic commands: lines typed at a shell prompt that optix handles itself
+# instead of forwarding to the shell. With this enabled, typing
+#   theme ayu          switch to the "ayu" theme (no shell error, no /theme)
+#   theme              list the available themes
+# at a shell prompt changes the theme without the shell trying to run a
+# `theme` program.
+[magic]
+enabled = true
+
+# IPC: serve commands over a Unix socket so external tools can drive a running
+# terminal, e.g. `optix-msg theme ayu`, `optix-msg themes`, `optix-msg ping`.
+# This is the reliable way to switch themes on the fly (no /theme overlay, no
+# shell cooperation needed).
+[ipc]
+enabled = true
+
+# Keybindings: "mods+key" = "action"
+# mods: ctrl, shift, alt, super (any order, separated by +)
+# Actions:
+#   split_right split_below close_pane next_pane prev_pane
+#   focus_pane_up focus_pane_down focus_pane_left focus_pane_right
+#   scroll_up scroll_down page_up page_down scroll_top scroll_bottom
+#   search search_next search_prev
+#   copy paste
+#   font_increase font_decrease font_reset
+#   command          open the /command line (e.g. "/theme ayu")
+#   quit
+[keybindings]
+"ctrl+shift+e" = "split_right"
+"ctrl+shift+o" = "split_below"
+"ctrl+shift+x" = "close_pane"
+"ctrl+shift+]" = "next_pane"
+"ctrl+shift+[" = "prev_pane"
+"ctrl+alt+up" = "focus_pane_up"
+"ctrl+alt+down" = "focus_pane_down"
+"ctrl+alt+left" = "focus_pane_left"
+"ctrl+alt+right" = "focus_pane_right"
+"ctrl+shift+f" = "search"
+"ctrl+shift+enter" = "search_next"
+"ctrl+shift+p" = "command"   # open the /command line, e.g. "/theme ayu"
+"ctrl+shift+up" = "scroll_up"
+"ctrl+shift+down" = "scroll_down"
+"ctrl+shift+pageup" = "page_up"
+"ctrl+shift+pagedown" = "page_down"
+"ctrl+shift+home" = "scroll_top"
+"ctrl+shift+end" = "scroll_bottom"
+"ctrl+shift+c" = "copy"
+"ctrl+shift+v" = "paste"
+"ctrl+plus" = "font_increase"
+"ctrl+minus" = "font_decrease"
+"ctrl+0" = "font_reset"
+"ctrl+shift+q" = "quit"

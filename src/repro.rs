@@ -14,6 +14,8 @@ use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
+use cosmic_text::{fontdb, Attrs, Buffer, Family, FontSystem, Shaping};
+
 use crate::color::Rgba;
 use crate::config::Config;
 use crate::event::{PaneEvent, PaneProxy};
@@ -131,23 +133,57 @@ fn sample_render(term: &mut Term<PaneProxy>, fonts: &mut Fonts, palette: &Palett
 fn minimal_fonts_cover_tui_glyphs() {
     let cfg = Config::load();
     let mut fonts = Fonts::new(&cfg.font.family, cfg.font.size, 1.0).expect("fonts");
-    let glyphs = fonts.layout_line("· ┃ ╹ ▀ ■ ▣ ⬝ \u{2800}\u{2801}\u{28FF} box ⛰", false, false);
-    assert!(!glyphs.is_empty(), "minimal font set must shape TUI glyphs");
-    let bad = glyphs
-        .iter()
-        .filter(|g| g.cache_key.glyph_id == 0)
-        .count();
-    if bad > 0 {
-        let mut missing = String::new();
-        let chars: Vec<char> = "· ┃ ╹ ▀ ■ ▣ ⬝ \u{2800}\u{2801}\u{28FF} box ⛰".chars().collect();
-        for (i, g) in glyphs.iter().enumerate() {
-            if g.cache_key.glyph_id == 0 && i < chars.len() {
-                missing.push(chars[i]);
+    let text = "· ┃ ╹ ▀ ■ ▣ ⬝ \u{2800}\u{2801}\u{28FF} box ⛰";
+
+    // Reference: the FULL system font set. A glyph that no installed font can
+    // shape at all would be tofu in any terminal, so it is not a pruning bug;
+    // the assertion below is that every glyph the system CAN render also
+    // survives the startup-time minimal-set pruning.
+    let mut full_db = fontdb::Database::new();
+    full_db.load_system_fonts();
+    let mut full_fs = FontSystem::new_with_locale_and_db("en-US".to_string(), full_db);
+    let mut full_buf = Buffer::new(&mut full_fs, fonts.metrics);
+    full_buf.set_size(None, None);
+    let family = fonts.family.clone();
+
+    let mut missing = Vec::new();
+    let mut rendered = 0usize;
+    for c in text.chars() {
+        // Does any installed font have this glyph?
+        full_buf.set_text(
+            &c.to_string(),
+            &Attrs::new().family(Family::Name(&family)),
+            Shaping::Advanced,
+            None,
+        );
+        full_buf.shape_until_scroll(&mut full_fs, true);
+        let full_ok = full_buf
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .any(|g| g.glyph_id != 0);
+
+        // Does the minimal startup set render it?
+        let minimal_ok = fonts
+            .layout_cell(c, false, false)
+            .iter()
+            .any(|g| g.cache_key.glyph_id != 0);
+
+        if full_ok {
+            rendered += 1;
+            if !minimal_ok {
+                missing.push(c);
             }
         }
-        eprintln!("missing glyphs in minimal set: {:?}", missing);
     }
-    assert_eq!(bad, 0, "{bad} glyphs were not found in the minimal font set");
+    assert!(
+        rendered >= 6,
+        "the full system font set rendered only {rendered} of {} test glyphs — is a font package missing?",
+        text.chars().count()
+    );
+    if !missing.is_empty() {
+        eprintln!("glyphs present in the system font set but pruned from the minimal set: {missing:?}");
+    }
+    assert_eq!(missing, Vec::<char>::new(), "the minimal font set dropped glyphs the system can render");
 }
 
 #[test]

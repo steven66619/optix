@@ -83,8 +83,14 @@ pub struct OptixApp {
     command: Option<String>,
     /// Heuristic: the next key press starts a fresh shell line.
     line_start: bool,
+    /// Text forwarded to the shell since the last Enter, shadowing the shell's
+    /// line editor so magic commands (`theme ayu`) can be recognized at Enter.
+    pending_line: String,
     /// Transient feedback shown after running a command, e.g. "Unknown theme".
     command_message: Option<(String, Instant)>,
+    /// IPC socket channel: requests from `optix-msg` arrive here.
+    ipc_tx: mpsc::Sender<crate::ipc::IpcRequest>,
+    ipc_rx: mpsc::Receiver<crate::ipc::IpcRequest>,
 }
 
 impl OptixApp {
@@ -99,6 +105,12 @@ impl OptixApp {
         let config_mtime = std::fs::metadata(crate::config::config_path())
             .and_then(|m| m.modified())
             .ok();
+        let (ipc_tx, ipc_rx) = mpsc::channel::<crate::ipc::IpcRequest>();
+        if config.ipc_enabled {
+            // Serve `optix-msg` on a background thread; commands arrive on
+            // `ipc_rx` and are executed in `handle_ipc`.
+            crate::ipc::spawn(ipc_tx.clone(), el_wakeup.clone());
+        }
         Self {
             palette,
             base_font_size,
@@ -126,7 +138,10 @@ impl OptixApp {
             config_mtime,
             command: None,
             line_start: true,
+            pending_line: String::new(),
             command_message: None,
+            ipc_tx,
+            ipc_rx,
         }
     }
 
@@ -357,6 +372,20 @@ impl OptixApp {
         self.search = Some(SearchOverlay { query: String::new() });
     }
 
+    /// Open the internal `/command` overlay regardless of shell line state.
+    ///
+    /// The plain-`/` trigger only fires while `line_start` is true, which goes
+    /// stale after a TUI app exits or a line is interrupted (no Enter reaches
+    /// the shell). A keybinding gives a deterministic way to reach `/theme`
+    /// and future commands.
+    fn open_command(&mut self) {
+        self.command = Some("/".to_string());
+        self.line_start = false;
+        self.command_message = None;
+        self.pending_line.clear();
+        self.window().request_redraw();
+    }
+
     fn update_search(&mut self) {
         let query = self.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
         if let Some(pane) = self.focused_pane() {
@@ -410,6 +439,7 @@ impl OptixApp {
                 }
             },
             "search" => self.open_search(),
+            "command" => self.open_command(),
             "search_next" => {
                 if let Some(pane) = self.focused_pane() {
                     pane.search_next();
@@ -443,6 +473,7 @@ impl OptixApp {
         {
             self.command = Some("/".to_string());
             self.line_start = false;
+            self.pending_line.clear();
             self.window().request_redraw();
             return;
         }
@@ -465,11 +496,15 @@ impl OptixApp {
                         self.write_to_shell(&cmd);
                         self.write_to_shell("\r");
                     }
+                    self.pending_line.clear();
                     self.window().request_redraw();
                     return;
                 },
                 CommandKey::Cancel => {
-                    self.line_start = false;
+                    // Nothing was sent to the shell while composing, so the
+                    // shell is still sitting at its prompt.
+                    self.line_start = true;
+                    self.pending_line.clear();
                     self.window().request_redraw();
                     return;
                 },
@@ -478,6 +513,7 @@ impl OptixApp {
                     // command: let the shell see what was typed so far, then
                     // process this key normally below.
                     self.line_start = false;
+                    self.pending_line.clear();
                     self.write_to_shell(&cmd);
                 },
             }
@@ -519,13 +555,44 @@ impl OptixApp {
             }
         };
 
+        // A plain Enter submits the shell line. Detect it from the key event
+        // rather than the encoded bytes: the kitty keyboard protocol encodes
+        // Enter as `CSI 13 u`, not a literal `\r`, so the old byte check made
+        // `line_start` go stale and `/theme` stopped triggering.
+        let enter_pressed = event.state == ElementState::Pressed
+            && !event.repeat
+            && matches!(&event.logical_key, Key::Named(NamedKey::Enter));
+
+        // Swallow magic shell lines (e.g. `theme ayu`) before Enter reaches
+        // the shell, so the shell never sees (or errors on) the command.
+        if enter_pressed && self.try_magic_line() {
+            self.line_start = true;
+            self.window().request_redraw();
+            return;
+        }
+
         let bytes = input::encode_key(&event, mods, mode);
         if !bytes.is_empty() {
             if let Some(pane) = self.focused_pane() {
                 pane.write(&bytes);
             }
-            // Track line-start so `/` only opens a command at a fresh line.
-            self.line_start = bytes.contains(&b'\r');
+            if enter_pressed {
+                // A line was submitted: the next key starts a fresh one.
+                self.pending_line.clear();
+                self.line_start = true;
+            } else if mods.ctrl {
+                // Line-editing keys (Ctrl-C, Ctrl-A, Ctrl-K, ...) change the
+                // shell's buffer in ways we cannot shadow reliably; reset the
+                // pending line rather than guess wrong.
+                self.pending_line.clear();
+                self.line_start = false;
+            } else {
+                // Plain text on the current line: shadow it and leave the
+                // line-start heuristic so `/` only opens a command at the
+                // very beginning of a line.
+                self.update_pending_line(&bytes);
+                self.line_start = false;
+            }
         }
     }
 
@@ -587,28 +654,99 @@ impl OptixApp {
     fn run_theme_command(&mut self, line: &str) {
         let args: Vec<&str> = line.split_whitespace().collect();
         if args.len() < 2 {
-            let names = crate::themes::names();
-            self.command_message = Some((
-                format!(
-                    "themes: {} — try /theme <name>, or drop <name>.toml in ~/.config/optix/themes/",
-                    names.join(", ")
-                ),
-                Instant::now(),
-            ));
+            self.list_themes();
             return;
         }
         let name = args[1];
+        self.set_theme(name);
+    }
+
+    /// Apply a theme by name. Returns the feedback text, which is also shown
+    /// in the overlay so `/theme` and `optix-msg` share one code path.
+    fn set_theme(&mut self, name: &str) -> String {
         match crate::themes::by_name(name) {
             Some(theme) => {
                 self.palette = Palette::from_theme(&theme);
                 log::info!("theme set to `{name}`");
-                self.command_message = Some((format!("theme set to {name}"), Instant::now()));
+                let msg = format!("theme set to {name}");
+                self.command_message = Some((msg.clone(), Instant::now()));
+                msg
             },
             None => {
-                self.command_message =
-                    Some((format!("unknown theme `{name}`"), Instant::now()));
+                let msg = format!("error: unknown theme `{name}`");
+                self.command_message = Some((msg.clone(), Instant::now()));
+                msg
             },
         }
+    }
+
+    /// List the available themes. Returns the feedback text (shared with the
+    /// overlay and `optix-msg themes`).
+    fn list_themes(&mut self) -> String {
+        let names = crate::themes::names();
+        let msg = format!(
+            "themes: {} — try `theme <name>`, or drop <name>.toml in ~/.config/optix/themes/",
+            names.join(", ")
+        );
+        self.command_message = Some((msg.clone(), Instant::now()));
+        msg
+    }
+
+    /// Drain IPC requests from `optix-msg`, execute them, and send the reply
+    /// back to the waiting client. Returns true if the UI should redraw.
+    fn handle_ipc(&mut self) -> bool {
+        let mut dirty = false;
+        while let Ok(request) = self.ipc_rx.try_recv() {
+            dirty = true;
+            let reply = self.execute_ipc(&request.command);
+            let _ = request.reply.send(reply);
+        }
+        dirty
+    }
+
+    /// Execute a single IPC command line and produce the reply text.
+    fn execute_ipc(&mut self, line: &str) -> String {
+        match crate::ipc::IpcCommand::parse(line) {
+            crate::ipc::IpcCommand::Ping => "pong".to_string(),
+            crate::ipc::IpcCommand::Themes => self.list_themes(),
+            crate::ipc::IpcCommand::ThemeSet(name) => self.set_theme(&name),
+            crate::ipc::IpcCommand::Quit => {
+                self.quit = true;
+                "ok: quitting".to_string()
+            },
+            crate::ipc::IpcCommand::Unknown(cmd) => {
+                format!("error: unknown command `{cmd}` (try `theme <name>`, `themes`, `ping`, `quit`)")
+            },
+        }
+    }
+
+    /// If the text typed since the last Enter is a magic command (e.g. `theme
+    /// ayu`), swallow it here: clear the shell's line editor and run the
+    /// action internally. Returns true when the line was consumed, in which
+    /// case the caller must not forward the Enter to the shell.
+    fn try_magic_line(&mut self) -> bool {
+        if !self.config.magic_enabled {
+            return false;
+        }
+        let Some(cmd) = crate::magic::parse(&self.pending_line) else { return false };
+        // The line is consumed by the terminal either way; clear the shadow
+        // buffer so a later Enter on an empty line cannot re-run it.
+        self.pending_line.clear();
+        // The shell already echoed the line and holds it in its line editor;
+        // cancel it (Ctrl-U = kill-to-line-start in bash/zsh readline default
+        // bindings) so it is never executed on a later Enter.
+        self.write_to_shell("\x15");
+        match cmd {
+            crate::magic::Magic::ThemeList => self.list_themes(),
+            crate::magic::Magic::ThemeSet(name) => self.set_theme(&name),
+        };
+        true
+    }
+
+    /// Track text forwarded to the shell so the current line can be recognized
+    /// as a magic command when Enter is pressed. Called for non-Enter keys.
+    fn update_pending_line(&mut self, bytes: &[u8]) {
+        track_pending_line(&mut self.pending_line, bytes);
     }
 
     /// Write raw text into the focused pane's PTY (as if typed).
@@ -1365,7 +1503,9 @@ impl ApplicationHandler for OptixApp {
         }
         // Live reload: pick up config.toml edits (colors, fonts, window opts).
         let reloaded = self.reload_config_if_changed();
-        if self.handle_events() || reloaded {
+        // Commands arriving over the IPC socket (`optix-msg theme ayu`, ...).
+        let ipc = self.handle_ipc();
+        if self.handle_events() || reloaded || ipc {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -1408,6 +1548,27 @@ fn command_trigger(mods: Mods, line_start: bool, state: ElementState, repeat: bo
         && !repeat
         && mods.is_empty()
         && matches!(key, Key::Character(ch) if ch == "/")
+}
+
+/// Mirror the shell's line buffer as plain text so magic commands (`theme
+/// ayu`) can be recognized when Enter is pressed. `bytes` are what was
+/// forwarded to the shell for a single non-Enter key press.
+fn track_pending_line(buf: &mut String, bytes: &[u8]) {
+    if bytes == b"\x7f" || bytes == b"\x08" {
+        // Backspace erases the last character of the pending line.
+        buf.pop();
+        return;
+    }
+    // Control bytes (Tab, classically-encoded arrows, ...) don't add text.
+    if bytes.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+        return;
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        // Magic commands are short; cap the shadow line defensively.
+        if buf.len() < 256 {
+            buf.push_str(text);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1484,5 +1645,46 @@ mod tests {
         let ctrl = Mods { ctrl: true, shift: false, alt: false, super_: false };
         let mut cmd2 = "/theme".to_string();
         assert!(matches!(command_edit(&mut cmd2, ctrl, ElementState::Pressed, false, &ctrl_c), CommandKey::Flush));
+    }
+
+    #[test]
+    fn pending_line_shadows_typed_text() {
+        let mut buf = String::new();
+        for &b in b"theme ayu".iter() {
+            track_pending_line(&mut buf, &[b]);
+        }
+        assert_eq!(buf, "theme ayu");
+    }
+
+    #[test]
+    fn pending_line_backspace_pops() {
+        let mut buf = String::new();
+        for &b in b"themea".iter() {
+            track_pending_line(&mut buf, &[b]);
+        }
+        track_pending_line(&mut buf, b"\x7f");
+        assert_eq!(buf, "theme");
+    }
+
+    #[test]
+    fn pending_line_ignores_control_bytes_and_caps_length() {
+        let mut buf = String::new();
+        track_pending_line(&mut buf, b"\x1b[A"); // arrow escape
+        assert!(buf.is_empty());
+        track_pending_line(&mut buf, b"\t");
+        assert!(buf.is_empty());
+
+        for b in b"a".repeat(300) {
+            track_pending_line(&mut buf, &[b]);
+        }
+        assert_eq!(buf.len(), 256);
+    }
+
+    #[test]
+    fn magic_lines_and_shell_lines_round_trip() {
+        // The pure detection: "theme ayu" is magic, other lines are not.
+        assert!(matches!(crate::magic::parse("theme ayu"), Some(crate::magic::Magic::ThemeSet(_))));
+        assert!(crate::magic::parse("ls -la").is_none());
+        assert!(crate::magic::parse("theme ayu extra").is_none());
     }
 }

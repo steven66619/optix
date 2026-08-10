@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "A GPU-accelerated terminal emulator: kitty-grade power, modern looks."
 
+[lib]
+name = "optix"
+path = "src/lib.rs"
+
 [[bin]]
 name = "optix"
 path = "src/main.rs"
+
+[[bin]]
+name = "optix-msg"
+path = "src/bin/optix-msg.rs"
 
 [dependencies]
 alacritty_terminal = "0.26"

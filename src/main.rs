@@ -1,33 +1,11 @@
-// Several pieces of the API (selection rendering, clipboard-type handling,
-// background-image loading) are wired for upcoming features and not all
-// call sites exist yet, so dead code is expected during development.
-#![allow(dead_code)]
-
-mod app;
-mod color;
-mod config;
-mod event;
-mod fonts;
-mod input;
-mod kitty;
-mod layout;
-mod palette;
-mod pty_io;
-mod render;
-mod terminal;
-mod themes;
-
-#[cfg(test)]
-mod repro;
-
 use std::sync::mpsc;
 use std::time::Duration;
 
 use winit::event_loop::EventLoop;
 
-use crate::app::OptixApp;
-use crate::config::Config;
-use crate::event::PaneEvent;
+use optix::app::OptixApp;
+use optix::config::Config;
+use optix::event::PaneEvent;
 
 fn main() {
     env_logger::init();
@@ -53,12 +31,16 @@ fn main() {
     if let Err(err) = event_loop.run_app(&mut app) {
         log::error!("event loop error: {err}");
     }
+
+    // Remove the IPC socket left behind by a clean shutdown. A stale socket
+    // from a crash is unlinked automatically at the next launch.
+    let _ = std::fs::remove_file(optix::ipc::socket_path());
 }
 
 /// Poll the config file's mtime and wake the event loop when it changes.
 fn spawn_config_watcher(wakeup: winit::event_loop::EventLoopProxy<()>) {
     std::thread::spawn(move || {
-        let path = config::config_path();
+        let path = optix::config::config_path();
         let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         loop {
             std::thread::sleep(Duration::from_millis(500));

@@ -1,0 +1,13 @@
+Package: optix
+Architecture: amd64
+Maintainer: Steven Atkinson <steven4x4@gmail.com>
+Section: x11
+Priority: optional
+Homepage: https://github.com/steven66619/optix
+Depends: libc6, fontconfig
+Description: GPU-accelerated terminal emulator
+ A GPU-accelerated terminal emulator written in Rust. Uses wgpu for
+ rendering, alacritty_terminal for the terminal core, and cosmic-text
+ for high-quality font shaping. Features split panes, kitty graphics,
+ runtime themes, IPC control, and smooth scrollback browsing.
+Version: 0.1.0-1

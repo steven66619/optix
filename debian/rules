@@ -1,0 +1,34 @@
+#!/usr/bin/make -f
+
+# Build optix with cargo into the package staging dir.
+PREFIX = /usr
+
+clean:
+	cargo clean 2>/dev/null || true
+
+build:
+	# Incremental-release in a scratch CARGO_TARGET_DIR so the package build
+	# never clobbers the developer's own target/ tree.
+	cargo build --release --target-dir $(CURDIR)/target-deb
+
+install: build
+	install -d $(CURDIR)/debian/optix/usr/bin
+	install -Dm755 target-deb/release/optix $(CURDIR)/debian/optix/usr/bin/optix
+	install -Dm755 target-deb/release/optix-msg $(CURDIR)/debian/optix/usr/bin/optix-msg
+
+# Substitute the host architecture for the binary stanza's `any` so the
+# resulting .deb is installable (dpkg rejects `Architecture: any` on binaries).
+ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)
+
+binary-arch: install
+	mkdir -p $(CURDIR)/debian/optix/DEBIAN
+	awk '/^Package:/ {p=1} p' debian/control \
+	    | sed 's/^Architecture: any$$/Architecture: $(ARCH)/' \
+	    > $(CURDIR)/debian/optix/DEBIAN/control
+	sed -n 's/.*(\(.*\)).*/\1/p' debian/changelog | head -1 | \
+	    xargs -I{} echo "Version: {}" >> $(CURDIR)/debian/optix/DEBIAN/control
+	dpkg-deb --root-owner-group --build $(CURDIR)/debian/optix $(CURDIR)/..
+
+binary: binary-arch
+
+.PHONY: clean build install binary-arch binary

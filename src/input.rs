@@ -855,3 +855,128 @@ fn named_sequence(named: NamedKey, mods: Mods, app_cursor: bool) -> Option<Vec<u
     let _ = app_cursor;
     Some(out)
 }
+
+/// Xterm modifier flags folded into the mouse report button code.
+fn mouse_modifier_flags(mods: Mods) -> u16 {
+    let mut bits = 0;
+    // Per the SGR/X10 mouse protocols: shift +4, meta/alt +8, ctrl +16.
+    if mods.shift {
+        bits += 4;
+    }
+    if mods.alt {
+        bits += 8;
+    }
+    if mods.ctrl {
+        bits += 16;
+    }
+    bits
+}
+
+/// SGR mouse button codes. `3` marks a button release (any button).
+const MOUSE_RELEASE: u16 = 3;
+/// SGR code for motion with no button held.
+const MOUSE_MOTION: u16 = 32;
+/// SGR code for drag motion with a button held.
+const MOUSE_DRAG: u16 = 35;
+
+/// Encode one mouse event as SGR or X10 bytes for the PTY.
+///
+/// * `button` — SGR button code (0 = left, 1 = middle, 2 = right, 3 = release,
+///   64/65/66/67 = wheel up/down/left/right, 32/35 = motion/drag).
+/// * `col`/`row` — 0-based grid position; converted to 1-based for reporting.
+/// * `mods` — modifier state folded into the report's button code.
+/// * `sgr` — use SGR (`CSI < Cb ; Cx ; Cy M`) instead of legacy X10 (`CSI M b x y`).
+pub fn encode_mouse(button: u16, col: usize, row: usize, mods: Mods, sgr: bool) -> Vec<u8> {
+    let code = button + mouse_modifier_flags(mods);
+    if sgr {
+        format!("\x1b[<{code};{};{}M", col + 1, row + 1).into_bytes()
+    } else {
+        let mut out = Vec::with_capacity(6);
+        out.extend_from_slice(b"\x1b[M");
+        out.push((code + 32) as u8);
+        out.push((col + 1 + 32) as u8);
+        out.push((row + 1 + 32) as u8);
+        out
+    }
+}
+
+/// Encode a wheel scroll as mouse-report bytes.
+///
+/// `delta_lines` is the number of lines to scroll (positive = toward older
+/// content / wheel up). Line-delta devices report whole notches; pixel-delta
+/// devices (touchpads) accumulate fractional lines, so this rounds and emits
+/// one report per whole line crossed so apps see discrete wheel steps.
+pub fn encode_mouse_wheel(delta_lines: f64, col: usize, row: usize, mods: Mods, sgr: bool) -> Vec<u8> {
+    let steps = delta_lines.abs().round() as usize;
+    if steps == 0 {
+        return Vec::new();
+    }
+    let button = if delta_lines > 0.0 { 64 } else { 65 };
+    let mut out = Vec::with_capacity(steps * 12);
+    for _ in 0..steps {
+        out.extend_from_slice(&encode_mouse(button, col, row, mods, sgr));
+    }
+    out
+}
+
+/// Whether the terminal is in any mouse-reporting mode (app wants mouse events).
+pub fn mouse_reporting_active(mode: TermMode) -> bool {
+    mode.intersects(
+        TermMode::MOUSE_REPORT_CLICK
+            | TermMode::MOUSE_MOTION
+            | TermMode::MOUSE_DRAG
+            | TermMode::SGR_MOUSE
+            | TermMode::UTF8_MOUSE,
+    )
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+
+    #[test]
+    fn sgr_wheel_up_is_reported() {
+        // Wheel up at column 4, row 7 -> `CSI < 64 ; 5 ; 8 M`.
+        let bytes = encode_mouse_wheel(1.0, 4, 7, Mods::default(), true);
+        assert_eq!(bytes, b"\x1b[<64;5;8M");
+    }
+
+    #[test]
+    fn sgr_wheel_down_with_ctrl() {
+        // ctrl (+16) + wheel down (65) = 81.
+        let mods = Mods { ctrl: true, ..Mods::default() };
+        let bytes = encode_mouse_wheel(-1.0, 0, 0, mods, true);
+        assert_eq!(bytes, b"\x1b[<81;1;1M");
+    }
+
+    #[test]
+    fn sgr_click_press_and_release() {
+        let mods = Mods::default();
+        assert_eq!(encode_mouse(0, 1, 2, mods, true), b"\x1b[<0;2;3M");
+        assert_eq!(encode_mouse(MOUSE_RELEASE, 1, 2, mods, true), b"\x1b[<3;2;3M");
+    }
+
+    #[test]
+    fn x10_encoding_offsets_by_32() {
+        // Legacy X10: `ESC [ M` then each byte + 32 (button first).
+        let bytes = encode_mouse(0, 0, 0, Mods::default(), false);
+        assert_eq!(bytes, b"\x1b[M" .iter().copied().chain([32, 33, 33]).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn fractional_wheel_rounds_to_steps() {
+        let mods = Mods::default();
+        // 2.6 lines -> 3 wheel reports (one per whole line).
+        let bytes = encode_mouse_wheel(2.6, 0, 0, mods, true);
+        assert_eq!(bytes, b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M");
+        // 0.3 lines below a step -> nothing yet (avoids wheel jitter).
+        assert!(encode_mouse_wheel(0.3, 0, 0, mods, true).is_empty());
+    }
+
+    #[test]
+    fn mouse_reporting_detection() {
+        assert!(mouse_reporting_active(TermMode::SGR_MOUSE));
+        assert!(mouse_reporting_active(TermMode::MOUSE_REPORT_CLICK));
+        assert!(!mouse_reporting_active(TermMode::empty()));
+    }
+}

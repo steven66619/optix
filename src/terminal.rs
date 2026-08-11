@@ -237,6 +237,45 @@ impl TerminalPane {
         guard.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Whether the app has enabled any mouse-reporting mode. When true, mouse
+    /// events must be forwarded to the PTY (SGR/X10) instead of being consumed
+    /// for optix's own scrollback/selection UI.
+    pub fn mouse_reporting(&self) -> bool {
+        let guard = self.term.lock();
+        crate::input::mouse_reporting_active(*guard.mode())
+    }
+
+    /// Whether SGR encoding should be used for mouse reports (X10 otherwise).
+    pub fn mouse_sgr(&self) -> bool {
+        let guard = self.term.lock();
+        guard.mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    /// Whether the app wants motion (not just click) reports: 1002 drag or
+    /// 1003 any-motion reporting.
+    pub fn mouse_motion_reports(&self) -> bool {
+        let guard = self.term.lock();
+        guard.mode().intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+    }
+
+    /// Write a mouse-report sequence to the app's PTY.
+    pub fn write_mouse(&mut self, button: u16, col: usize, row: usize, mods: crate::input::Mods) {
+        let sgr = self.mouse_sgr();
+        let bytes = crate::input::encode_mouse(button, col, row, mods, sgr);
+        if !bytes.is_empty() {
+            self.write(&bytes);
+        }
+    }
+
+    /// Write a wheel mouse-report to the app's PTY (discrete steps).
+    pub fn write_mouse_wheel(&mut self, delta_lines: f64, col: usize, row: usize, mods: crate::input::Mods) {
+        let sgr = self.mouse_sgr();
+        let bytes = crate::input::encode_mouse_wheel(delta_lines, col, row, mods, sgr);
+        if !bytes.is_empty() {
+            self.write(&bytes);
+        }
+    }
+
     /// Convert window coordinates (already mapped into the pane's client area, pixels) to a grid point.
     pub fn point_at(&self, x: f32, y: f32, cell_w: f32, cell_h: f32, padding_x: f32, padding_y: f32) -> Point {
         let col = ((x - padding_x) / cell_w).floor().max(0.0) as usize;
@@ -246,6 +285,17 @@ impl TerminalPane {
         let line = (row as i32 - display_offset as i32).max(-(display_offset as i32));
         let col = col.min(self.cols.saturating_sub(1));
         Point::new(Line(line), Column(col))
+    }
+
+    /// The visible grid cell under a window point, as 0-based (col, row) in the
+    /// current viewport. Used for mouse-report coordinates (SGR/X10), which are
+    /// relative to the on-screen grid regardless of scrollback offset.
+    pub fn cell_at(&self, x: f32, y: f32, cell_w: f32, cell_h: f32, padding_x: f32, padding_y: f32) -> (usize, usize) {
+        let col = ((x - padding_x) / cell_w).floor().max(0.0) as usize;
+        let row = ((y - padding_y) / cell_h).floor().max(0.0) as usize;
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.lines.saturating_sub(1));
+        (col, row)
     }
 
     pub fn clear_selection(&mut self) {

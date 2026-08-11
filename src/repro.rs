@@ -256,3 +256,31 @@ fn opencode_stream_renders_without_panic() {
     }
     let _ = sender;
 }
+
+#[test]
+fn mouse_reporting_activates_from_escape_sequences() {
+    // TUI apps enable SGR mouse reporting with `CSI ? 1006 h` (plus a click
+    // mode like 1000). optix must then treat mouse input as app-owned.
+    let (term_arc, sender) = setup();
+    {
+        let mut guard = term_arc.lock();
+        assert!(!crate::input::mouse_reporting_active(*guard.mode()));
+        feed(&mut guard, b"\x1b[?1000h\x1b[?1006h");
+        assert!(crate::input::mouse_reporting_active(*guard.mode()));
+        assert!(guard.mode().contains(alacritty_terminal::term::TermMode::SGR_MOUSE));
+    }
+    let _ = sender;
+}
+
+#[test]
+fn mouse_reporting_turns_off_with_disable_sequence() {
+    let (term_arc, sender) = setup();
+    {
+        let mut guard = term_arc.lock();
+        feed(&mut guard, b"\x1b[?1000h\x1b[?1006h");
+        assert!(crate::input::mouse_reporting_active(*guard.mode()));
+        feed(&mut guard, b"\x1b[?1000l\x1b[?1006l");
+        assert!(!crate::input::mouse_reporting_active(*guard.mode()));
+    }
+    let _ = sender;
+}

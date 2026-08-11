@@ -648,20 +648,53 @@ impl OptixApp {
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
-        let lines = match delta {
-            MouseScrollDelta::LineDelta(_, y) => y as f64 * self.config.scroll.wheel_lines,
-            MouseScrollDelta::PixelDelta(pos) => pos.y / cell_h as f64,
+        // `lines` is optix's own scrollback distance (scaled by wheel_lines);
+        // `steps` is the raw wheel motion apps expect in SGR/X10 reports
+        // (a LineDelta of 1.0 is one notch, a PixelDelta is fractional lines).
+        let (lines, steps) = match delta {
+            MouseScrollDelta::LineDelta(_, y) => {
+                let steps = y as f64;
+                (steps * self.config.scroll.wheel_lines, steps)
+            },
+            MouseScrollDelta::PixelDelta(pos) => {
+                let steps = pos.y / cell_h as f64;
+                (steps, steps)
+            },
         };
-        if lines == 0.0 {
+        if lines == 0.0 && steps == 0.0 {
             return;
         }
         // Scroll the pane under the cursor (browser behavior), not just the
         // focused one — handy when reading output in an unfocused split.
-        let momentum = self.config.scroll.smooth && self.config.scroll.momentum;
-        if let Some((id, _)) = self.pane_at(self.mouse_pos) {
-            if let Some(pane) = self.panes.get_mut(&id) {
-                pane.scroll_wheel(lines, momentum);
+        let Some((id, rect)) = self.pane_at(self.mouse_pos) else { return };
+        let (pad_x, pad_y) = self.padding();
+        let cell_w = self.fonts.as_ref().map(|f| f.cell_w).unwrap_or(8.0);
+
+        // When the app under the cursor asked for mouse reports (TUIs like
+        // opencode, vim, less, htop, ...), forward the wheel to it so IT can
+        // scroll its own content. Never let optix's scrollback steal it.
+        let (col, row) = {
+            let Some(pane) = self.panes.get(&id) else { return };
+            pane.cell_at(
+                (self.mouse_pos.0 - rect.x as f64) as f32,
+                (self.mouse_pos.1 - rect.y as f64) as f32,
+                cell_w,
+                cell_h,
+                pad_x,
+                pad_y,
+            )
+        };
+        {
+            let Some(pane) = self.panes.get_mut(&id) else { return };
+            if pane.mouse_reporting() {
+                pane.write_mouse_wheel(steps, col, row, self.mods);
+                return;
             }
+        }
+
+        let momentum = self.config.scroll.smooth && self.config.scroll.momentum;
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.scroll_wheel(lines, momentum);
         }
     }
 
@@ -789,15 +822,71 @@ impl OptixApp {
     fn on_mouse(&mut self, state: ElementState, button: MouseButton) {
         match button {
             MouseButton::Left => self.on_mouse_left(state),
-            // X11 convention: middle-click pastes the PRIMARY selection. Fire on
-            // press only, otherwise the click's press + release would paste twice.
-            MouseButton::Middle if state == ElementState::Pressed => self.paste_selection(),
+            MouseButton::Middle if state == ElementState::Pressed => {
+                // Apps with mouse reporting get middle-click forwarded;
+                // otherwise X11 convention pastes the PRIMARY selection.
+                // Fire on press only so press + release don't double-paste.
+                if !self.forward_mouse_click(1, state) {
+                    self.paste_selection();
+                }
+            },
+            MouseButton::Right => self.on_mouse_right(state),
             _ => {},
+        }
+    }
+
+    /// Forward a mouse press/release to the app if it enabled mouse reporting.
+    /// Returns true when the event was consumed (not for optix's own UI).
+    fn forward_mouse_click(&mut self, button: u16, state: ElementState) -> bool {
+        let Some((id, rect)) = self.pane_at(self.mouse_pos) else { return false };
+        if !self.panes.get(&id).map(|p| p.mouse_reporting()).unwrap_or(false) {
+            return false;
+        }
+        let (pad_x, pad_y) = self.padding();
+        let cell_w = self.fonts.as_ref().map(|f| f.cell_w).unwrap_or(8.0);
+        let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
+        let (col, row) = {
+            let Some(pane) = self.panes.get(&id) else { return false };
+            pane.cell_at(
+                (self.mouse_pos.0 - rect.x as f64) as f32,
+                (self.mouse_pos.1 - rect.y as f64) as f32,
+                cell_w,
+                cell_h,
+                pad_x,
+                pad_y,
+            )
+        };
+        // Release reports as button code 3; presses use the button's own code.
+        let code = if state == ElementState::Released { 3 } else { button };
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.write_mouse(code, col, row, self.mods);
+        }
+        true
+    }
+
+    fn on_mouse_right(&mut self, state: ElementState) {
+        // Apps with mouse reporting get right-click forwarded; otherwise it
+        // can open a context menu / do nothing.
+        if self.forward_mouse_click(2, state) {
+            return;
+        }
+        if state == ElementState::Pressed {
+            log::debug!("right-click without mouse mode (ignored)");
         }
     }
 
     fn on_mouse_left(&mut self, state: ElementState) {
         let pos = self.mouse_pos;
+
+        // If the app under the cursor requested mouse reports, forward the
+        // event and skip optix's selection/scrollbar handling entirely.
+        if self.forward_mouse_click(0, state) {
+            if state == ElementState::Released {
+                self.dragging = false;
+                self.drag_scrollbar = false;
+            }
+            return;
+        }
 
         match state {
             ElementState::Pressed => {
@@ -899,6 +988,34 @@ impl OptixApp {
 
     fn on_mouse_move(&mut self, position: PhysicalPosition<f64>) {
         self.mouse_pos = (position.x, position.y);
+
+        // When the app under the cursor requested motion/drag reports, forward
+        // the move to it (button 32 = motion, 35 = drag). Optix's own
+        // selection/scrollbar logic is bypassed while reporting is active.
+        if let Some((id, rect)) = self.pane_at(self.mouse_pos) {
+            let motion = {
+                let pane = self.panes.get(&id);
+                pane.map(|p| p.mouse_reporting() && p.mouse_motion_reports()).unwrap_or(false)
+            };
+            if motion {
+                let (pad_x, pad_y) = self.padding();
+                let cell_w = self.fonts.as_ref().map(|f| f.cell_w).unwrap_or(8.0);
+                let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    let (col, row) = pane.cell_at(
+                        (self.mouse_pos.0 - rect.x as f64) as f32,
+                        (self.mouse_pos.1 - rect.y as f64) as f32,
+                        cell_w,
+                        cell_h,
+                        pad_x,
+                        pad_y,
+                    );
+                    let code = if self.dragging { 35 } else { 32 };
+                    pane.write_mouse(code, col, row, self.mods);
+                }
+                return;
+            }
+        }
 
         // Dragging the scrollbar thumb: map the pointer to a scroll position.
         if self.drag_scrollbar {
@@ -1574,6 +1691,13 @@ fn draw_scroll_ui(
     let history = pane.history_lines() as f64;
     let pos = pane.scroll.pos;
     let alpha = pane.scroll.bar_alpha;
+
+    // Apps that own the mouse (opencode, vim, ...) handle scrolling and any
+    // hover chrome themselves; optix never draws over them.
+    if pane.mouse_reporting() {
+        pane.scroll.hover = false;
+        return;
+    }
 
     // Track whether the pointer is over the bar (drives auto-show). Alt-screen
     // panes report no history, so they never get a bar or hover state.

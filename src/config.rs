@@ -14,6 +14,7 @@ pub struct Config {
     pub theme: ParsedTheme,
     pub font: Font,
     pub window: Window,
+    pub scroll: Scroll,
     pub shell: Option<String>,
     pub working_directory: Option<PathBuf>,
     /// `"ctrl+shift+t"` -> action name.
@@ -91,6 +92,32 @@ impl Default for Window {
     }
 }
 
+/// Scrollback browsing behavior. Only ever applies to the terminal's own
+/// history (never to TUI apps on the alternate screen).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Scroll {
+    /// Animate wheel scrollback motion instead of jumping line-by-line.
+    pub smooth: bool,
+    /// Draw the auto-hiding scrollbar overlay while browsing scrollback.
+    pub scrollbar: bool,
+    /// Keep coasting after a wheel flick (inertia).
+    pub momentum: bool,
+    /// Base lines per wheel notch used when the device sends line deltas.
+    pub wheel_lines: f64,
+}
+
+impl Default for Scroll {
+    fn default() -> Self {
+        Self {
+            smooth: true,
+            scrollbar: true,
+            momentum: true,
+            wheel_lines: 3.0,
+        }
+    }
+}
+
 /// Raw (string) theme as it appears in the config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -114,6 +141,13 @@ pub struct Theme {
     pub background_gradient: Option<Gradient>,
     /// Color the window flashes when the bell rings.
     pub bell: String,
+    /// Scrollbar overlay colors. All optional; sensible colors are derived
+    /// from the theme when omitted.
+    pub scrollbar_thumb: Option<String>,
+    pub scrollbar_track: Option<String>,
+    pub scrollbar_thumb_hover: Option<String>,
+    pub scrollbar_badge_background: Option<String>,
+    pub scrollbar_badge_foreground: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +227,11 @@ impl Default for Theme {
                 bottom: "#16161d".into(),
             }),
             bell: "#f9e2af".into(),
+            scrollbar_thumb: None,
+            scrollbar_track: None,
+            scrollbar_thumb_hover: None,
+            scrollbar_badge_background: None,
+            scrollbar_badge_foreground: None,
         }
     }
 }
@@ -216,6 +255,11 @@ pub struct ParsedTheme {
     pub search_match_foreground: Option<Rgba>,
     pub background_gradient: Option<(Rgba, Rgba)>,
     pub bell: Rgba,
+    pub scrollbar_thumb: Rgba,
+    pub scrollbar_track: Rgba,
+    pub scrollbar_thumb_hover: Rgba,
+    pub scrollbar_badge_background: Rgba,
+    pub scrollbar_badge_foreground: Rgba,
 }
 
 fn parse_hex(s: &str, fallback: Rgba) -> Rgba {
@@ -232,6 +276,7 @@ impl Config {
             theme: ParsedTheme::from_raw(&Theme::default()),
             font: Font::default(),
             window: Window::default(),
+            scroll: Scroll::default(),
             shell: None,
             working_directory: None,
             keybindings: default_keybindings(),
@@ -313,10 +358,15 @@ impl ParsedTheme {
             Some(d) => std::array::from_fn(|i| parse_hex(&d[i], dim_default(i))),
             None => std::array::from_fn(dim_default),
         };
+        // Scrollbar colors default to theme-derived translucencies so every
+        // theme (built-in or user) looks good without extra configuration.
+        let foreground = parse_hex(&raw.foreground, Rgba::from_u8(205, 214, 244, 255));
+        let search_background = parse_hex(&raw.search_background, Rgba::rgb(0.19, 0.2, 0.27));
+        let search_foreground = parse_hex(&raw.search_foreground, Rgba::rgb(0.8, 0.84, 0.96));
 
         Self {
             background: parse_hex(&raw.background, Rgba::from_u8(30, 30, 46, 255)),
-            foreground: parse_hex(&raw.foreground, Rgba::from_u8(205, 214, 244, 255)),
+            foreground,
             cursor: parse_hex(&raw.cursor, Rgba::from_u8(245, 224, 220, 255)),
             cursor_text: raw.cursor_text.as_deref().and_then(|c| Rgba::from_hex(c).ok()),
             selection_background: parse_hex(&raw.selection_background, Rgba::from_u8(88, 91, 112, 255)),
@@ -326,8 +376,8 @@ impl ParsedTheme {
             dim,
             split_border: parse_hex(&raw.split_border, Rgba::rgb(0.27, 0.29, 0.35)),
             split_active: parse_hex(&raw.split_active, Rgba::rgb(0.54, 0.71, 0.98)),
-            search_background: parse_hex(&raw.search_background, Rgba::rgb(0.19, 0.2, 0.27)),
-            search_foreground: parse_hex(&raw.search_foreground, Rgba::rgb(0.8, 0.84, 0.96)),
+            search_background,
+            search_foreground,
             search_match_background: parse_hex(&raw.search_match_background, Rgba::rgb(0.54, 0.71, 0.98)),
             search_match_foreground: raw.search_match_foreground.as_deref().and_then(|c| Rgba::from_hex(c).ok()),
             background_gradient: raw.background_gradient.as_ref().map(|g| {
@@ -337,6 +387,31 @@ impl ParsedTheme {
                 )
             }),
             bell: parse_hex(&raw.bell, Rgba::rgb(0.98, 0.85, 0.69)),
+            scrollbar_thumb: raw
+                .scrollbar_thumb
+                .as_deref()
+                .and_then(|c| Rgba::from_hex(c).ok())
+                .unwrap_or_else(|| foreground.with_alpha(0.35)),
+            scrollbar_track: raw
+                .scrollbar_track
+                .as_deref()
+                .and_then(|c| Rgba::from_hex(c).ok())
+                .unwrap_or_else(|| foreground.with_alpha(0.10)),
+            scrollbar_thumb_hover: raw
+                .scrollbar_thumb_hover
+                .as_deref()
+                .and_then(|c| Rgba::from_hex(c).ok())
+                .unwrap_or_else(|| foreground.with_alpha(0.6)),
+            scrollbar_badge_background: raw
+                .scrollbar_badge_background
+                .as_deref()
+                .and_then(|c| Rgba::from_hex(c).ok())
+                .unwrap_or(search_background),
+            scrollbar_badge_foreground: raw
+                .scrollbar_badge_foreground
+                .as_deref()
+                .and_then(|c| Rgba::from_hex(c).ok())
+                .unwrap_or(search_foreground),
         }
     }
 }
@@ -348,6 +423,7 @@ struct TomlConfig {
     theme: Option<Theme>,
     font: Option<Font>,
     window: Option<Window>,
+    scroll: Option<Scroll>,
     shell: Option<String>,
     working_directory: Option<String>,
     keybindings: HashMap<String, String>,
@@ -362,6 +438,7 @@ impl TomlConfig {
             theme: ParsedTheme::from_raw(&self.theme.unwrap_or_default()),
             font: self.font.unwrap_or_default(),
             window: self.window.unwrap_or_default(),
+            scroll: self.scroll.unwrap_or_default(),
             shell: self.shell,
             working_directory: self.working_directory.map(PathBuf::from),
             keybindings: defaults.keybindings,
@@ -448,11 +525,26 @@ search_match_background = "#89b4fa"
 # search_match_foreground = "#1e1e2e"
 bell = "#f9e2af"
 
+# Scrollbar overlay colors (all optional; derived from the theme when omitted).
+# scrollbar_thumb = "#cdd6f4"
+# scrollbar_track = "#cdd6f4"
+# scrollbar_thumb_hover = "#ffffff"
+# scrollbar_badge_background = "#313244"
+# scrollbar_badge_foreground = "#cdd6f4"
+
 # Vertical gradient painted behind the terminal when no image is set.
 # Remove this section for a flat background.
 [theme.background_gradient]
 top = "#2b2b40"
 bottom = "#16161d"
+
+# Scrollback browsing. Only applies to the terminal's own history — TUI apps
+# on the alternate screen (vim, less, atuin, ...) are never touched.
+[scroll]
+smooth = true            # glide scrollback motion instead of line jumps
+scrollbar = true         # auto-hiding scrollbar overlay while browsing history
+momentum = true          # keep coasting after a wheel flick
+wheel_lines = 3.0        # base lines per wheel notch (line-delta mice)
 
 # Magic commands: lines typed at a shell prompt that optix handles itself
 # instead of forwarding to the shell. With this enabled, typing
@@ -558,5 +650,30 @@ mod tests {
             toml::from_str("[ipc]\nenabled = false").expect("valid TOML");
         let config = cfg.into_config();
         assert!(!config.ipc_enabled);
+    }
+
+    #[test]
+    fn scroll_defaults_when_section_absent() {
+        // Config files written before the `[scroll]` section existed must still
+        // load with working scroll defaults (smooth glide + auto-hiding bar).
+        let cfg: TomlConfig = toml::from_str("[font]\nsize = 12.0").unwrap();
+        assert!(cfg.scroll.is_none());
+        let config = cfg.into_config();
+        assert!(config.scroll.smooth, "smooth scrolling must default on");
+        assert!(config.scroll.scrollbar, "scrollbar must default on");
+        assert!(config.scroll.momentum, "momentum must default on");
+        assert_eq!(config.scroll.wheel_lines, 3.0);
+    }
+
+    #[test]
+    fn scroll_section_overrides_defaults() {
+        let cfg: TomlConfig =
+            toml::from_str("[scroll]\nsmooth = false\nmomentum = false\nscrollbar = false\nwheel_lines = 1.5")
+                .expect("valid TOML");
+        let config = cfg.into_config();
+        assert!(!config.scroll.smooth);
+        assert!(!config.scroll.momentum);
+        assert!(!config.scroll.scrollbar);
+        assert_eq!(config.scroll.wheel_lines, 1.5);
     }
 }

@@ -16,6 +16,7 @@ pub mod magic;
 pub mod palette;
 pub mod pty_io;
 pub mod render;
+pub mod scroll;
 pub mod terminal;
 pub mod themes;
 

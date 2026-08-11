@@ -14,6 +14,7 @@ use alacritty_terminal::tty::{self, Options as PtyOptions};
 use crate::event::{PaneEvent, PaneProxy};
 use crate::kitty::KittyStore;
 use crate::pty_io::{PtyIo, PtyMsg};
+use crate::scroll::ScrollState;
 
 /// Search state for one terminal pane.
 pub struct SearchState {
@@ -41,6 +42,8 @@ pub struct TerminalPane {
     pub lines: usize,
     /// True while a search is active and matches must be redrawn.
     pub search_active: bool,
+    /// Smooth scrollback browsing state (position, momentum, scrollbar fade).
+    pub scroll: ScrollState,
 }
 
 struct PaneSize {
@@ -62,6 +65,7 @@ impl Dimensions for PaneSize {
 
 impl TerminalPane {
     /// Spawn a shell inside a fresh PTY with the given grid size.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: usize,
         pty_opts: &PtyOptions,
@@ -71,6 +75,7 @@ impl TerminalPane {
         cell_h: u16,
         tx: mpsc::Sender<PaneEvent>,
         el_wakeup: Option<winit::event_loop::EventLoopProxy<()>>,
+        smooth_scroll: bool,
     ) -> std::io::Result<Self> {
         let term_config = TermConfig { kitty_keyboard: true, ..TermConfig::default() };
 
@@ -102,6 +107,7 @@ impl TerminalPane {
             cols,
             lines,
             search_active: false,
+            scroll: ScrollState::new(smooth_scroll),
         })
     }
 
@@ -139,12 +145,96 @@ impl TerminalPane {
     }
 
     /// Scroll the viewport (ignored while an app is on the alternate screen).
+    /// Keyboard-driven actions are applied as instant line steps; wheel input
+    /// goes through [`TerminalPane::scroll_wheel`] so it can glide.
     pub fn scroll(&mut self, scroll: Scroll) {
-        let mut guard = self.term.lock();
-        if guard.mode().contains(TermMode::ALT_SCREEN) {
+        match scroll {
+            Scroll::Delta(lines) => self.scroll_lines(lines as f64, false),
+            Scroll::PageUp => self.scroll_lines(self.lines as f64, false),
+            Scroll::PageDown => self.scroll_lines(-(self.lines as f64), false),
+            Scroll::Top => self.scroll_jump(f64::INFINITY),
+            Scroll::Bottom => self.scroll_jump(0.0),
+        }
+    }
+
+    /// Scroll by `delta` lines. Positive scrolls toward older content.
+    /// When `momentum` is set (wheel input) and smooth scrolling is enabled,
+    /// the delta is applied as an impulse so the viewport glides.
+    pub fn scroll_lines(&mut self, delta: f64, momentum: bool) {
+        if self.on_alt_screen() {
             return;
         }
-        guard.scroll_display(scroll);
+        self.scroll.input(delta, momentum);
+    }
+
+    /// Jump to an absolute scroll position (in lines from the bottom).
+    pub fn scroll_jump(&mut self, to: f64) {
+        if self.on_alt_screen() {
+            return;
+        }
+        let history = self.history_lines();
+        self.scroll.jump(to.clamp(0.0, history as f64));
+    }
+
+    /// Wheel input with momentum feel; only ever touches the scrollback.
+    pub fn scroll_wheel(&mut self, delta: f64, momentum: bool) {
+        self.scroll_lines(delta, momentum);
+    }
+
+    /// Drop straight back to the prompt after browsing scrollback (e.g. the
+    /// user typed something). Immediate, never animated.
+    pub fn scroll_to_bottom(&mut self) {
+        if self.on_alt_screen() {
+            return;
+        }
+        let mut guard = self.term.lock();
+        guard.grid_mut().scroll_display(Scroll::Bottom);
+        drop(guard);
+        self.scroll.jump(0.0);
+        self.scroll.shift = 0.0;
+    }
+
+    /// Advance the smooth-scroll animation by `dt` seconds, moving the grid in
+    /// whole-line steps. Returns true when another frame is needed.
+    pub fn scroll_tick(&mut self, dt: f32, cell_h: f32) -> bool {
+        let mut guard = self.term.lock();
+        if guard.mode().contains(TermMode::ALT_SCREEN) {
+            // Never animate, fade, or touch the grid while a TUI app owns the
+            // screen (vim, less, atuin, ...). They scroll themselves.
+            self.scroll.resync(0);
+            return false;
+        }
+        // Something else may have moved the grid (search jump, input auto
+        // scroll-to-bottom); resync so position and grid never disagree.
+        let actual = guard.grid().display_offset();
+        if (actual as f64 - self.scroll.applied).abs() > 0.5 {
+            self.scroll.resync(actual);
+        }
+        let history = guard.grid().history_size();
+        let (needs_draw, delta) = self.scroll.tick(dt as f64, history);
+        if let Some(delta) = delta {
+            guard.grid_mut().scroll_display(Scroll::Delta(delta));
+            self.scroll.applied = guard.grid().display_offset() as f64;
+        }
+        // Fractional remainder -> pixel shift for the renderer.
+        let frac = self.scroll.pos - self.scroll.pos.round();
+        self.scroll.shift = frac as f32 * cell_h;
+        needs_draw
+    }
+
+    /// Number of scrollback lines available right now (0 on the alt screen).
+    pub fn history_lines(&self) -> usize {
+        let guard = self.term.lock();
+        if guard.mode().contains(TermMode::ALT_SCREEN) {
+            return 0;
+        }
+        guard.grid().history_size()
+    }
+
+    /// Whether the pane is on the alternate screen (a TUI app is running).
+    pub fn on_alt_screen(&self) -> bool {
+        let guard = self.term.lock();
+        guard.mode().contains(TermMode::ALT_SCREEN)
     }
 
     /// Convert window coordinates (already mapped into the pane's client area, pixels) to a grid point.

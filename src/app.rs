@@ -3,7 +3,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::ClipboardType;
@@ -26,6 +27,7 @@ use crate::kitty::{KittyImage, Placement, KITTY_MARKER};
 use crate::layout::{self, Layout, Orientation, PaneId, Rect};
 use crate::palette::Palette;
 use crate::render::{Frame, Renderer};
+use crate::scroll::{bar_geom, bottom_pill, top_pill};
 use crate::terminal::{is_visible, TerminalPane};
 
 /// Active search overlay state (bound to the focused pane).
@@ -91,6 +93,12 @@ pub struct OptixApp {
     /// IPC socket channel: requests from `optix-msg` arrive here.
     ipc_tx: mpsc::Sender<crate::ipc::IpcRequest>,
     ipc_rx: mpsc::Receiver<crate::ipc::IpcRequest>,
+    /// When the previous frame was drawn, for scroll-animation dt.
+    last_frame: Instant,
+    /// True while the scrollbar thumb is being dragged.
+    drag_scrollbar: bool,
+    /// Pane whose scrollbar is being dragged (may differ from the focused one).
+    drag_scrollbar_pane: Option<PaneId>,
 }
 
 impl OptixApp {
@@ -142,6 +150,9 @@ impl OptixApp {
             command_message: None,
             ipc_tx,
             ipc_rx,
+            last_frame: Instant::now(),
+            drag_scrollbar: false,
+            drag_scrollbar_pane: None,
         }
     }
 
@@ -185,7 +196,7 @@ impl OptixApp {
         let fonts = self.fonts.as_ref().expect("fonts ready");
         let cell_w = fonts.cell_w as u16;
         let cell_h = fonts.cell_h as u16;
-        match TerminalPane::new(id, &opts, cols, lines, cell_w, cell_h, self.event_tx.clone(), Some(self.el_wakeup.clone())) {
+        match TerminalPane::new(id, &opts, cols, lines, cell_w, cell_h, self.event_tx.clone(), Some(self.el_wakeup.clone()), self.config.scroll.smooth) {
             Ok(pane) => {
                 self.panes.insert(id, pane);
                 Some(id)
@@ -574,6 +585,9 @@ impl OptixApp {
         let bytes = input::encode_key(&event, mods, mode);
         if !bytes.is_empty() {
             if let Some(pane) = self.focused_pane() {
+                // Browsing scrollback and then typing should drop you back at
+                // the prompt — never leave the user typing into the void.
+                pane.scroll_to_bottom();
                 pane.write(&bytes);
             }
             if enter_pressed {
@@ -635,12 +649,18 @@ impl OptixApp {
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
         let lines = match delta {
-            MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,
-            MouseScrollDelta::PixelDelta(pos) => (pos.y / cell_h as f64) as i32,
+            MouseScrollDelta::LineDelta(_, y) => y as f64 * self.config.scroll.wheel_lines,
+            MouseScrollDelta::PixelDelta(pos) => pos.y / cell_h as f64,
         };
-        if lines != 0 {
-            if let Some(pane) = self.focused_pane() {
-                pane.scroll(Scroll::Delta(lines));
+        if lines == 0.0 {
+            return;
+        }
+        // Scroll the pane under the cursor (browser behavior), not just the
+        // focused one — handy when reading output in an unfocused split.
+        let momentum = self.config.scroll.smooth && self.config.scroll.momentum;
+        if let Some((id, _)) = self.pane_at(self.mouse_pos) {
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.scroll_wheel(lines, momentum);
             }
         }
     }
@@ -782,6 +802,10 @@ impl OptixApp {
         match state {
             ElementState::Pressed => {
                 if let Some((id, rect)) = self.pane_at(pos) {
+                    // Scrollbar and pills win over starting a text selection.
+                    if self.scrollbar_press(id, rect) {
+                        return;
+                    }
                     self.layout.tab_mut().focus(id);
                     let (pad_x, pad_y) = self.padding();
                     let cell_w = self.fonts.as_ref().map(|f| f.cell_w).unwrap_or(8.0);
@@ -802,12 +826,102 @@ impl OptixApp {
             },
             ElementState::Released => {
                 self.dragging = false;
+                self.drag_scrollbar = false;
+                if let Some(id) = self.drag_scrollbar_pane.take() {
+                    if let Some(pane) = self.panes.get_mut(&id) {
+                        pane.scroll.dragging = false;
+                    }
+                }
             },
         }
     }
 
+    /// Handle a mouse press on the focused-adjacent pane's scrollbar or one of
+    /// the floating navigation pills. Returns true if the press was consumed.
+    fn scrollbar_press(&mut self, id: PaneId, rect: Rect) -> bool {
+        let pos = self.mouse_pos;
+        let dpi = self.dpi_scale;
+
+        // Navigation pills: "back to bottom" / "back to top".
+        let history = self.panes.get(&id).map(|p| p.history_lines() as f64).unwrap_or(0.0);
+        if history > 0.0 {
+            let scroll_pos = self.panes.get(&id).map(|p| p.scroll.pos).unwrap_or(0.0);
+            let pill = bottom_pill((rect.x, rect.y, rect.w, rect.h), dpi);
+            if scroll_pos > 0.5 && pill.contains(pos.0 as f32, pos.1 as f32) {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.scroll_jump(0.0);
+                }
+                return true;
+            }
+            let top = top_pill((rect.x, rect.y, rect.w, rect.h), dpi);
+            if history > 0.0 && scroll_pos >= history - 0.5 && top.contains(pos.0 as f32, pos.1 as f32) {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.scroll_jump(f64::INFINITY);
+                }
+                return true;
+            }
+        }
+
+        if history <= 0.0 {
+            return false;
+        }
+
+        // Scrollbar track / thumb.
+        let (screen_lines, pos_off) = {
+            let pane = self.panes.get(&id).expect("pane exists");
+            (pane.lines, pane.scroll.pos)
+        };
+        let geom = bar_geom((rect.x, rect.y, rect.w, rect.h), dpi, pos_off, history, screen_lines);
+        if !geom.hit_test(pos.0 as f32, pos.1 as f32) {
+            return false;
+        }
+        if geom.on_thumb(pos.0 as f32, pos.1 as f32) {
+            // Grab the thumb: record the grab point so it doesn't jump.
+            self.drag_scrollbar = true;
+            self.drag_scrollbar_pane = Some(id);
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.scroll.dragging = true;
+                pane.scroll.drag_grab = pos.1 as f32 - geom.thumb_y;
+            }
+        } else if pos.1 < geom.thumb_y as f64 {
+            // Click above the thumb: page toward older content.
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.scroll_lines(-(pane.lines as f64), false);
+            }
+        } else {
+            // Click below the thumb: page toward newer content.
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.scroll_lines(pane.lines as f64, false);
+            }
+        }
+        true
+    }
+
     fn on_mouse_move(&mut self, position: PhysicalPosition<f64>) {
         self.mouse_pos = (position.x, position.y);
+
+        // Dragging the scrollbar thumb: map the pointer to a scroll position.
+        if self.drag_scrollbar {
+            if let Some(id) = self.drag_scrollbar_pane {
+                if let Some((_, rect)) = self.pane_at(self.mouse_pos) {
+                    let dpi = self.dpi_scale;
+                    if let Some(pane) = self.panes.get_mut(&id) {
+                        let history = pane.history_lines() as f64;
+                        if history > 0.0 {
+                            let (screen_lines, pos_off) = (pane.lines, pane.scroll.pos);
+                            let geom = bar_geom((rect.x, rect.y, rect.w, rect.h), dpi, pos_off, history, screen_lines);
+                            let track_span = (geom.track_h - geom.thumb_h).max(1.0) as f64;
+                            let frac =
+                                ((self.mouse_pos.1 as f32 - geom.track_y - pane.scroll.drag_grab) as f64 / track_span)
+                                    .clamp(0.0, 1.0);
+                            pane.scroll_jump(frac * history);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         if !self.dragging {
             return;
         }
@@ -867,7 +981,13 @@ impl OptixApp {
         // Colors are re-resolved from the new theme; the terminal palette is
         // re-derived so every pane immediately uses the new scheme.
         self.palette = Palette::from_theme(&new_cfg.theme);
+        let old_scroll_smooth = self.config.scroll.smooth;
         self.config = new_cfg;
+        if self.config.scroll.smooth != old_scroll_smooth {
+            for pane in self.panes.values_mut() {
+                pane.scroll.smooth = self.config.scroll.smooth;
+            }
+        }
 
         let font_changed = self.config.font.family != old_family
             || self.config.font.size != old_base_size;
@@ -1020,6 +1140,22 @@ impl OptixApp {
         let (pad_x, pad_y) = self.padding();
         let (w, h) = self.window_size();
 
+        // Advance scrollback animations (momentum glide, scrollbar fade) and
+        // keep the frame loop running while any pane is still in motion.
+        let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+        let mut scrolling = false;
+        for pane in self.panes.values_mut() {
+            if pane.scroll_tick(dt, cell_h) {
+                scrolling = true;
+            }
+        }
+        if scrolling {
+            self.window().request_redraw();
+        }
+
         let Some(renderer) = self.renderer.as_mut() else { return };
         let Some(fonts) = self.fonts.as_mut() else { return };
         let theme = &self.config.theme;
@@ -1114,6 +1250,25 @@ impl OptixApp {
 
         if let Some((_, focused_rect)) = rects.iter().find(|(id, _)| *id == focused_id) {
             frame.rect(focused_rect.x, focused_rect.y, focused_rect.w, 1.0, theme.split_active);
+        }
+
+        // Scrollback browsing chrome: auto-hiding scrollbar, "back to
+        // bottom/top" pills, and the top fade. Skipped entirely on the
+        // alternate screen so TUI apps (vim, atuin, less, ...) are untouched.
+        if self.config.scroll.scrollbar {
+            for (id, rect) in &rects {
+                if let Some(pane) = self.panes.get_mut(id) {
+                    draw_scroll_ui(
+                        &mut frame,
+                        pane,
+                        rect,
+                        fonts,
+                        theme,
+                        self.dpi_scale,
+                        self.mouse_pos,
+                    );
+                }
+            }
         }
 
         if self.search.is_some() {
@@ -1251,98 +1406,120 @@ fn render_pane(
     let dynamic = content.colors;
     let cursor = content.cursor;
     let selection = guard.selection.as_ref().and_then(|s| s.to_range(&guard));
+    let grid = guard.grid();
     log::debug!("pane {} rect={rect:?} cols={} lines={} cursor_shape={:?} at={:?}", pane.id, pane.cols, pane.lines, cursor.shape, cursor.point);
 
     let mut cell_count = 0usize;
 
-    for indexed in content.display_iter {
-        let cell = indexed.cell;
-        let point = indexed.point;
-        if !is_visible(cell) {
+    // During a smooth glide, `shift` (fraction of a line, in pixels) offsets
+    // every row so text slides instead of jumping. One extra row is drawn at
+    // the edge the content is sliding from; when idle only the exact viewport
+    // rows are drawn.
+    let shift = pane.scroll.shift;
+    let lines_i = pane.lines as i32;
+    let history_i = grid.history_size() as i32;
+    let (r_start, r_end) = if shift != 0.0 { (-1, lines_i) } else { (0, lines_i - 1) };
+
+    for r in r_start..=r_end {
+        let y = pad_y + r as f32 * cell_h - shift;
+        if y + cell_h <= 0.0 || y >= rect.h {
             continue;
         }
-        let row = point.line.0 + display_offset;
-        let col = point.column.0;
-        if row < 0 || row >= pane.lines as i32 || col >= pane.cols {
+        let line = Line(r - display_offset);
+        if line.0 < -history_i || line.0 >= lines_i {
             continue;
         }
-        cell_count += 1;
-        if cell.c != ' ' && cell_count <= 80 {
-            log::debug!("cell ({row},{col}) {:?} fg={:?} bg={:?}", cell.c, cell.fg, cell.bg);
-        }
-        let x = rect.x + pad_x + col as f32 * cell_w;
-        let y = rect.y + pad_y + row as f32 * cell_h;
+        for (col, cell) in (&grid[line]).into_iter().enumerate() {
+            if col >= pane.cols {
+                break;
+            }
+            if !is_visible(cell) {
+                continue;
+            }
+            let point = Point::new(line, Column(col));
+            cell_count += 1;
+            if cell.c != ' ' && cell_count <= 80 {
+                log::debug!("cell ({r},{col}) {:?} fg={:?} bg={:?}", cell.c, cell.fg, cell.bg);
+            }
+            let x = rect.x + pad_x + col as f32 * cell_w;
+            let y_abs = rect.y + y;
 
-        let mut fg = cell.fg;
-        let mut bg = cell.bg;
-        if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
+            let mut fg = cell.fg;
+            let mut bg = cell.bg;
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
 
-        let cell_fg = if cell.flags.contains(Flags::DIM) {
-            if let Color::Named(n) = fg {
-                let idx = n as usize;
-                if idx < 8 {
-                    if let Some(rgb) = dynamic[259 + idx] {
-                        from_ansi_rgb(rgb)
+            let cell_fg = if cell.flags.contains(Flags::DIM) {
+                if let Color::Named(n) = fg {
+                    let idx = n as usize;
+                    if idx < 8 {
+                        if let Some(rgb) = dynamic[259 + idx] {
+                            from_ansi_rgb(rgb)
+                        } else {
+                            palette.dim[idx]
+                        }
                     } else {
-                        palette.dim[idx]
+                        palette.resolve(&fg, dynamic)
                     }
                 } else {
                     palette.resolve(&fg, dynamic)
                 }
             } else {
                 palette.resolve(&fg, dynamic)
+            };
+
+            let bg_rgba = palette.resolve(&bg, dynamic);
+            let is_default_bg = matches!(bg, Color::Named(n) if n as usize == NamedColor::Background as usize);
+            if !is_default_bg {
+                frame.rect(x, y_abs, cell_w, cell_h, bg_rgba);
             }
-        } else {
-            palette.resolve(&fg, dynamic)
-        };
 
-        let bg_rgba = palette.resolve(&bg, dynamic);
-        let is_default_bg = matches!(bg, Color::Named(n) if n as usize == NamedColor::Background as usize);
-        if !is_default_bg {
-            frame.rect(x, y, cell_w, cell_h, bg_rgba);
-        }
-
-        if pane.search_active {
-            let in_match = pane
-                .search
-                .as_ref()
-                .map(|s| s.matches.iter().any(|m| m.contains(&point)))
-                .unwrap_or(false);
-            if in_match {
-                frame.rect(x, y, cell_w, cell_h, theme.search_match_background);
+            if pane.search_active {
+                let in_match = pane
+                    .search
+                    .as_ref()
+                    .map(|s| s.matches.iter().any(|m| m.contains(&point)))
+                    .unwrap_or(false);
+                if in_match {
+                    frame.rect(x, y_abs, cell_w, cell_h, theme.search_match_background);
+                }
             }
-        }
 
-        if selection.as_ref().map(|r| r.contains(point)).unwrap_or(false) {
-            frame.rect(x, y, cell_w, cell_h, theme.selection_background);
-        }
-
-        if cell.c != ' ' && cell.c != KITTY_MARKER {
-            let bold = cell.flags.contains(Flags::BOLD);
-            let italic = cell.flags.contains(Flags::ITALIC);
-            for g in fonts.layout_cell(cell.c, bold, italic) {
-                frame.glyph(x + g.x, y + g.y, g.cache_key, cell_fg);
+            if selection.as_ref().map(|r| r.contains(point)).unwrap_or(false) {
+                frame.rect(x, y_abs, cell_w, cell_h, theme.selection_background);
             }
-        }
 
-        if cell.flags.contains(Flags::UNDERLINE) {
-            frame.rect(x, y + cell_h - 2.0, cell_w, 1.5, cell_fg);
-        }
-        if cell.flags.contains(Flags::STRIKEOUT) {
-            frame.rect(x, y + cell_h * 0.55, cell_w, 1.0, cell_fg);
+            if cell.c != ' ' && cell.c != KITTY_MARKER {
+                let bold = cell.flags.contains(Flags::BOLD);
+                let italic = cell.flags.contains(Flags::ITALIC);
+                for g in fonts.layout_cell(cell.c, bold, italic) {
+                    frame.glyph(x + g.x, y_abs + g.y, g.cache_key, cell_fg);
+                }
+            }
+
+            if cell.flags.contains(Flags::UNDERLINE) {
+                frame.rect(x, y_abs + cell_h - 2.0, cell_w, 1.5, cell_fg);
+            }
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                frame.rect(x, y_abs + cell_h * 0.55, cell_w, 1.0, cell_fg);
+            }
         }
     }
     log::debug!("pane {} visible cells: {cell_count}", pane.id);
 
     // Cursor.
     if cursor.shape != CursorShape::Hidden && focused {
-        let row = cursor.point.line.0 + display_offset;
+        let r = cursor.point.line.0 + display_offset;
+        let y = pad_y + r as f32 * cell_h - shift;
         let col = cursor.point.column.0;
-        if row >= 0 && (row as usize) < pane.lines && col < pane.cols {
+        let on_screen = (shift != 0.0 || (r >= 0 && (r as usize) < pane.lines))
+            && y + cell_h > 0.0
+            && y < rect.h
+            && col < pane.cols;
+        if on_screen {
             let cx = rect.x + pad_x + col as f32 * cell_w;
-            let cy = rect.y + pad_y + row as f32 * cell_h;
+            let cy = rect.y + y;
             let cursor_color = dynamic[NamedColor::Cursor as usize].map(from_ansi_rgb).unwrap_or(palette.cursor);
             let blinking = guard.cursor_style().blinking;
             if !blinking || (Instant::now().elapsed().as_millis() / 500).is_multiple_of(2) {
@@ -1374,6 +1551,118 @@ fn render_pane(
                     CursorShape::Hidden => {},
                 }
             }
+        }
+    }
+}
+
+/// Draw the scrollback browsing chrome for one pane: the auto-hiding
+/// scrollbar, the "back to bottom"/"back to top" pills, the top fade, and the
+/// percentage badge while the thumb is dragged.
+///
+/// Reads only the pane's scroll state and never touches the terminal grid or
+/// input, so TUI apps on the alternate screen are completely unaffected.
+#[allow(clippy::too_many_arguments)]
+fn draw_scroll_ui(
+    frame: &mut Frame,
+    pane: &mut TerminalPane,
+    rect: &Rect,
+    fonts: &mut Fonts,
+    theme: &ParsedTheme,
+    dpi: f32,
+    mouse: (f64, f64),
+) {
+    let history = pane.history_lines() as f64;
+    let pos = pane.scroll.pos;
+    let alpha = pane.scroll.bar_alpha;
+
+    // Track whether the pointer is over the bar (drives auto-show). Alt-screen
+    // panes report no history, so they never get a bar or hover state.
+    if history > 0.0 {
+        let geom = bar_geom((rect.x, rect.y, rect.w, rect.h), dpi, pos, history, pane.lines);
+        pane.scroll.hover = geom.hit_test(mouse.0 as f32, mouse.1 as f32);
+    } else {
+        pane.scroll.hover = false;
+    }
+
+    // Top fade: a soft scrim hinting there's more content above.
+    if pos > 0.5 {
+        let fade_h = (24.0 * dpi).min(rect.h * 0.25);
+        let slices = 10;
+        for i in 0..slices {
+            let t = i as f32 / slices as f32;
+            let a = 0.18 * (1.0 - t);
+            frame.rect(rect.x, rect.y + fade_h * t, rect.w, fade_h / slices as f32 + 1.0, Rgba::rgb(0.0, 0.0, 0.0).with_alpha(a));
+        }
+    }
+
+    if history <= 0.0 || alpha <= 0.02 {
+        return;
+    }
+
+    let geom = bar_geom((rect.x, rect.y, rect.w, rect.h), dpi, pos, history, pane.lines);
+
+    // Track + thumb.
+    frame.rect(geom.x, geom.track_y, geom.w, geom.track_h, theme.scrollbar_track.with_alpha(alpha));
+    let thumb_color = if pane.scroll.dragging || pane.scroll.hover {
+        theme.scrollbar_thumb_hover.with_alpha(alpha)
+    } else {
+        theme.scrollbar_thumb.with_alpha(alpha)
+    };
+    frame.rect(geom.x, geom.thumb_y, geom.w, geom.thumb_h, thumb_color);
+
+    // Percentage badge while dragging the thumb.
+    if pane.scroll.dragging {
+        let pct = ((pos / history.max(1.0)) * 100.0).round() as u32;
+        let label = format!("{pct}%");
+        let tw = fonts.measure(&label);
+        let bw = (tw + 20.0 * dpi).max(44.0 * dpi);
+        let bh = 22.0 * dpi;
+        let bx = (geom.x - bw - 10.0 * dpi).max(rect.x + 4.0 * dpi);
+        let by = (geom.thumb_y + geom.thumb_h * 0.5 - bh * 0.5)
+            .clamp(rect.y + 2.0 * dpi, rect.y + rect.h - bh - 2.0 * dpi);
+        frame.rect(bx, by, bw, bh, theme.scrollbar_badge_background);
+        let glyphs = fonts.layout_line(&label, false, false);
+        for g in glyphs {
+            frame.glyph(
+                bx + (bw - tw) * 0.5 + g.x,
+                by + (bh - fonts.cell_h) * 0.5 + g.y,
+                g.cache_key,
+                theme.scrollbar_badge_foreground,
+            );
+        }
+    }
+
+    // Navigation pills.
+    let pill_bg = theme.scrollbar_badge_background.with_alpha(alpha);
+    let pill_fg = theme.scrollbar_badge_foreground;
+    if pos > 0.5 {
+        let pill = bottom_pill((rect.x, rect.y, rect.w, rect.h), dpi);
+        let label = "↓ Back to bottom";
+        let tw = fonts.measure(label);
+        frame.rect(pill.x, pill.y, pill.w, pill.h, pill_bg);
+        let glyphs = fonts.layout_line(label, false, false);
+        for g in glyphs {
+            frame.glyph(
+                pill.x + (pill.w - tw) * 0.5 + g.x,
+                pill.y + (pill.h - fonts.cell_h) * 0.5 + g.y,
+                g.cache_key,
+                pill_fg,
+            );
+        }
+    }
+    if pane.scroll.is_at_top(history as usize) {
+        let pill = top_pill((rect.x, rect.y, rect.w, rect.h), dpi);
+        let label = "↑ Back to top";
+        let tw = fonts.measure(label);
+        frame.rect(pill.x, pill.y, pill.w, pill.h, pill_bg);
+        let glyphs = fonts.layout_line(label, false, false);
+        for g in glyphs {
+            frame.glyph(
+                pill.x + (pill.w - tw) * 0.5 + g.x,
+                pill.y + (pill.h - fonts.cell_h) * 0.5 + g.y,
+                g.cache_key,
+                pill_fg,
+            );
         }
     }
 }

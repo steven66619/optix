@@ -76,6 +76,10 @@ pub struct OptixApp {
     dpi_scale: f32,
     mouse_pos: (f64, f64),
     dragging: bool,
+    /// True when the mouse moved while a left-button drag was active (i.e. a
+    /// real selection was made, as opposed to a plain click). Used to
+    /// auto-copy on release without copying on simple clicks.
+    selection_dragged: bool,
     quit: bool,
     clipboard: Option<arboard::Clipboard>,
     default_title: String,
@@ -126,6 +130,7 @@ impl OptixApp {
             dpi_scale: 1.0,
             mouse_pos: (0.0, 0.0),
             dragging: false,
+            selection_dragged: false,
             quit: false,
             clipboard: None,
             default_title: config.window.title.clone(),
@@ -916,6 +921,7 @@ impl OptixApp {
                         );
                         pane.start_selection(SelectionType::Simple, point);
                         self.dragging = true;
+                        self.selection_dragged = false;
                     }
                 }
             },
@@ -927,6 +933,13 @@ impl OptixApp {
                         pane.scroll.dragging = false;
                     }
                 }
+                // Kitty-style: copy the selection to the clipboard when the
+                // drag is released (only if the mouse actually moved, so plain
+                // clicks don't copy).
+                if self.selection_dragged && self.config.copy_on_select {
+                    self.copy();
+                }
+                self.selection_dragged = false;
             },
         }
     }
@@ -1066,6 +1079,7 @@ impl OptixApp {
                     pad_y,
                 );
                 pane.update_selection(point);
+                self.selection_dragged = true;
             }
         }
     }

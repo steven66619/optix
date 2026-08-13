@@ -23,6 +23,9 @@ pub struct Config {
     pub magic_enabled: bool,
     /// Whether the `optix-msg` Unix-socket server is running.
     pub ipc_enabled: bool,
+    /// Copy the selection to the clipboard when a mouse drag selection is
+    /// released (kitty's `copy_on_select` behavior).
+    pub copy_on_select: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +285,7 @@ impl Config {
             keybindings: default_keybindings(),
             magic_enabled: true,
             ipc_enabled: true,
+            copy_on_select: true,
         }
     }
 
@@ -429,6 +433,7 @@ struct TomlConfig {
     keybindings: HashMap<String, String>,
     magic: Option<MagicCfg>,
     ipc: Option<IpcCfg>,
+    copy_on_select: Option<bool>,
 }
 
 impl TomlConfig {
@@ -444,6 +449,7 @@ impl TomlConfig {
             keybindings: defaults.keybindings,
             magic_enabled: self.magic.map(|m| m.enabled).unwrap_or(true),
             ipc_enabled: self.ipc.map(|i| i.enabled).unwrap_or(true),
+            copy_on_select: self.copy_on_select.unwrap_or(true),
         }
     }
 }
@@ -485,6 +491,10 @@ fn default_keybindings() -> HashMap<String, String> {
 
 const EXAMPLE_CONFIG: &str = r##"# Optix configuration.
 # This file is regenerated on first launch; all fields are optional.
+
+# Copy the selection to the clipboard when you release a mouse-drag selection,
+# like kitty. Set to false to require Ctrl+Shift+C.
+copy_on_select = true
 
 [font]
 family = "JetBrainsMono NF"   # any fontconfig family

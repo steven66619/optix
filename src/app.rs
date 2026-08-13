@@ -686,7 +686,7 @@ impl OptixApp {
         };
         {
             let Some(pane) = self.panes.get_mut(&id) else { return };
-            if pane.mouse_reporting() {
+            if pane.mouse_reporting() && !self.mods.shift {
                 pane.write_mouse_wheel(steps, col, row, self.mods);
                 return;
             }
@@ -838,6 +838,12 @@ impl OptixApp {
     /// Forward a mouse press/release to the app if it enabled mouse reporting.
     /// Returns true when the event was consumed (not for optix's own UI).
     fn forward_mouse_click(&mut self, button: u16, state: ElementState) -> bool {
+        // Shift bypasses mouse reporting (like kitty): let optix's own
+        // selection/scrollbar handling run instead of handing the event to
+        // the app. This is what makes Shift+drag copy work in TUIs.
+        if self.mods.shift {
+            return false;
+        }
         let Some((id, rect)) = self.pane_at(self.mouse_pos) else { return false };
         if !self.panes.get(&id).map(|p| p.mouse_reporting()).unwrap_or(false) {
             return false;
@@ -992,28 +998,31 @@ impl OptixApp {
         // When the app under the cursor requested motion/drag reports, forward
         // the move to it (button 32 = motion, 35 = drag). Optix's own
         // selection/scrollbar logic is bypassed while reporting is active.
-        if let Some((id, rect)) = self.pane_at(self.mouse_pos) {
-            let motion = {
-                let pane = self.panes.get(&id);
-                pane.map(|p| p.mouse_reporting() && p.mouse_motion_reports()).unwrap_or(false)
-            };
-            if motion {
-                let (pad_x, pad_y) = self.padding();
-                let cell_w = self.fonts.as_ref().map(|f| f.cell_w).unwrap_or(8.0);
-                let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
-                if let Some(pane) = self.panes.get_mut(&id) {
-                    let (col, row) = pane.cell_at(
-                        (self.mouse_pos.0 - rect.x as f64) as f32,
-                        (self.mouse_pos.1 - rect.y as f64) as f32,
-                        cell_w,
-                        cell_h,
-                        pad_x,
-                        pad_y,
-                    );
-                    let code = if self.dragging { 35 } else { 32 };
-                    pane.write_mouse(code, col, row, self.mods);
+        // Shift again bypasses reporting so drags can extend a selection.
+        if !self.mods.shift {
+            if let Some((id, rect)) = self.pane_at(self.mouse_pos) {
+                let motion = {
+                    let pane = self.panes.get(&id);
+                    pane.map(|p| p.mouse_reporting() && p.mouse_motion_reports()).unwrap_or(false)
+                };
+                if motion {
+                    let (pad_x, pad_y) = self.padding();
+                    let cell_w = self.fonts.as_ref().map(|f| f.cell_w).unwrap_or(8.0);
+                    let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
+                    if let Some(pane) = self.panes.get_mut(&id) {
+                        let (col, row) = pane.cell_at(
+                            (self.mouse_pos.0 - rect.x as f64) as f32,
+                            (self.mouse_pos.1 - rect.y as f64) as f32,
+                            cell_w,
+                            cell_h,
+                            pad_x,
+                            pad_y,
+                        );
+                        let code = if self.dragging { 35 } else { 32 };
+                        pane.write_mouse(code, col, row, self.mods);
+                    }
+                    return;
                 }
-                return;
             }
         }
 

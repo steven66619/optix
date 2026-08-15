@@ -1,3 +1,12 @@
+optix (0.1.0-2) unstable; urgency=medium
+
+  * Fix OSC 52 clipboard support for TUIs (alacritty-style handling,
+    CopyPaste mode so apps like opencode can query the clipboard).
+  * Add optional alacritty-style wheel scrolling ([scroll] mode = "alacritty")
+    alongside the browser-like momentum glide.
+
+ -- Steven Atkinson <steven4x4@gmail.com>  Sat, 15 Aug 2026 12:00:00 +0000
+
 optix (0.1.0-1) unstable; urgency=medium
 
   * Initial package.

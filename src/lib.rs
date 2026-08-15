@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod app;
+pub mod clipboard;
 pub mod color;
 pub mod config;
 pub mod event;

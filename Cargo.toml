@@ -19,7 +19,10 @@ path = "src/bin/optix-msg.rs"
 
 [dependencies]
 alacritty_terminal = "0.26"
-arboard = "3"
+# `wayland-data-control` matches alacritty: without it arboard cannot serve
+# or read the clipboard on Wayland sessions. On X11-only setups arboard
+# simply falls back to the X11 backend, so this is safe to keep on.
+arboard = { version = "3", features = ["wayland-data-control"] }
 base64 = "0.22"
 libc = "0.2"
 miniz_oxide = "0.8"

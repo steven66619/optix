@@ -95,24 +95,51 @@ impl Default for Window {
     }
 }
 
+/// How the mouse wheel scrolls the terminal's own scrollback history.
+///
+/// Alacritty-style scrolling was added as an option alongside optix's
+/// browser-like scrolling ("best of both worlds"): the `browser` mode keeps
+/// the smooth momentum glide, while `alacritty` ports alacritty's wheel
+/// handling — fractional pixel deltas accumulate until they form whole lines,
+/// then the grid jumps in line steps (no glide, no inertia).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollMode {
+    /// optix's browser-like smooth momentum scrolling.
+    Browser,
+    /// Alacritty-style accumulated line scrolling.
+    Alacritty,
+}
+
+impl Default for ScrollMode {
+    fn default() -> Self {
+        Self::Browser
+    }
+}
+
 /// Scrollback browsing behavior. Only ever applies to the terminal's own
 /// history (never to TUI apps on the alternate screen).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Scroll {
-    /// Animate wheel scrollback motion instead of jumping line-by-line.
+    /// Which wheel scrolling implementation to use.
+    pub mode: ScrollMode,
+    /// Animate wheel scrollback motion instead of jumping line-by-line
+    /// (browser mode only; ignored in alacritty mode).
     pub smooth: bool,
     /// Draw the auto-hiding scrollbar overlay while browsing scrollback.
     pub scrollbar: bool,
-    /// Keep coasting after a wheel flick (inertia).
+    /// Keep coasting after a wheel flick (inertia; browser mode only).
     pub momentum: bool,
     /// Base lines per wheel notch used when the device sends line deltas.
+    /// Doubles as alacritty's `scrolling.multiplier` in alacritty mode.
     pub wheel_lines: f64,
 }
 
 impl Default for Scroll {
     fn default() -> Self {
         Self {
+            mode: ScrollMode::Browser,
             smooth: true,
             scrollbar: true,
             momentum: true,
@@ -551,10 +578,13 @@ bottom = "#16161d"
 # Scrollback browsing. Only applies to the terminal's own history — TUI apps
 # on the alternate screen (vim, less, atuin, ...) are never touched.
 [scroll]
-smooth = true            # glide scrollback motion instead of line jumps
+mode = "browser"         # "browser" (smooth momentum glide) or "alacritty"
+                         # (alacritty-style accumulated line steps, no inertia)
+smooth = true            # glide scrollback motion instead of line jumps (browser mode)
 scrollbar = true         # auto-hiding scrollbar overlay while browsing history
-momentum = true          # keep coasting after a wheel flick
-wheel_lines = 3.0        # base lines per wheel notch (line-delta mice)
+momentum = true          # keep coasting after a wheel flick (browser mode)
+wheel_lines = 3.0        # lines per wheel notch; doubles as alacritty's
+                         # scrolling.multiplier in "alacritty" mode
 
 # Magic commands: lines typed at a shell prompt that optix handles itself
 # instead of forwarding to the shell. With this enabled, typing
@@ -673,6 +703,7 @@ mod tests {
         assert!(config.scroll.scrollbar, "scrollbar must default on");
         assert!(config.scroll.momentum, "momentum must default on");
         assert_eq!(config.scroll.wheel_lines, 3.0);
+        assert_eq!(config.scroll.mode, ScrollMode::Browser);
     }
 
     #[test]
@@ -685,5 +716,17 @@ mod tests {
         assert!(!config.scroll.momentum);
         assert!(!config.scroll.scrollbar);
         assert_eq!(config.scroll.wheel_lines, 1.5);
+        // Mode is independent of the other knobs; it only affects the wheel.
+        assert_eq!(config.scroll.mode, ScrollMode::Browser);
+    }
+
+    #[test]
+    fn scroll_mode_parses_alacritty() {
+        let cfg: TomlConfig =
+            toml::from_str("[scroll]\nmode = \"alacritty\"\nsmooth = false").expect("valid TOML");
+        let config = cfg.into_config();
+        assert_eq!(config.scroll.mode, ScrollMode::Alacritty);
+        // Invalid modes are rejected at parse time.
+        assert!(toml::from_str::<TomlConfig>("[scroll]\nmode = \"turbo\"").is_err());
     }
 }

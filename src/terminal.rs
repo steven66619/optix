@@ -77,7 +77,14 @@ impl TerminalPane {
         el_wakeup: Option<winit::event_loop::EventLoopProxy<()>>,
         smooth_scroll: bool,
     ) -> std::io::Result<Self> {
-        let term_config = TermConfig { kitty_keyboard: true, ..TermConfig::default() };
+        // `CopyPaste` allows both OSC 52 stores and loads, so TUIs like
+        // opencode can read the clipboard back (alacritty defaults to
+        // `OnlyCopy`, which silently denies queries and leaves apps hanging).
+        let term_config = TermConfig {
+            kitty_keyboard: true,
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
+            ..TermConfig::default()
+        };
 
         let dims = PaneSize { columns: cols, screen_lines: lines };
         let proxy_a = PaneProxy { pane_id: id, tx: tx.clone(), el_wakeup: el_wakeup.clone() };
@@ -216,8 +223,10 @@ impl TerminalPane {
             guard.grid_mut().scroll_display(Scroll::Delta(delta));
             self.scroll.applied = guard.grid().display_offset() as f64;
         }
-        // Fractional remainder -> pixel shift for the renderer.
-        let frac = self.scroll.pos - self.scroll.pos.round();
+        // Fractional remainder -> pixel shift for the renderer. Only smooth
+        // (browser) mode glides between lines; discrete/alacritty mode rests
+        // on whole lines, so the fractional accumulator must not show.
+        let frac = if self.scroll.smooth { self.scroll.pos - self.scroll.pos.round() } else { 0.0 };
         self.scroll.shift = frac as f32 * cell_h;
         needs_draw
     }
@@ -243,6 +252,14 @@ impl TerminalPane {
     pub fn mouse_reporting(&self) -> bool {
         let guard = self.term.lock();
         crate::input::mouse_reporting_active(*guard.mode())
+    }
+
+    /// Whether the app has enabled DECSET 1007 (alternate scroll). On the alt
+    /// screen such apps expect the terminal to turn wheel input into arrow
+    /// keys instead of scrolling the (invisible) scrollback.
+    pub fn alternate_scroll(&self) -> bool {
+        let guard = self.term.lock();
+        guard.mode().contains(TermMode::ALTERNATE_SCROLL)
     }
 
     /// Whether SGR encoding should be used for mouse reports (X10 otherwise).

@@ -81,7 +81,7 @@ pub struct OptixApp {
     /// auto-copy on release without copying on simple clicks.
     selection_dragged: bool,
     quit: bool,
-    clipboard: Option<arboard::Clipboard>,
+    clipboard: crate::clipboard::Clipboard,
     default_title: String,
     /// Last-seen mtime of the config file, for live reload.
     config_mtime: Option<std::time::SystemTime>,
@@ -132,7 +132,7 @@ impl OptixApp {
             dragging: false,
             selection_dragged: false,
             quit: false,
-            clipboard: None,
+            clipboard: crate::clipboard::Clipboard::new(),
             default_title: config.window.title.clone(),
             layout: Layout::new(0),
             panes: HashMap::new(),
@@ -172,6 +172,13 @@ impl OptixApp {
         )
     }
 
+    /// Whether panes glide when scrolling: smooth animation only exists in
+    /// browser mode. Alacritty mode always uses the discrete accumulated
+    /// line-step path (alacritty's own behavior).
+    fn scroll_smooth(&self) -> bool {
+        self.config.scroll.smooth && self.config.scroll.mode == crate::config::ScrollMode::Browser
+    }
+
     fn window_size(&self) -> (f32, f32) {
         self.renderer.as_ref().map(|r| (r.size.width as f32, r.size.height as f32)).unwrap_or((1.0, 1.0))
     }
@@ -201,7 +208,7 @@ impl OptixApp {
         let fonts = self.fonts.as_ref().expect("fonts ready");
         let cell_w = fonts.cell_w as u16;
         let cell_h = fonts.cell_h as u16;
-        match TerminalPane::new(id, &opts, cols, lines, cell_w, cell_h, self.event_tx.clone(), Some(self.el_wakeup.clone()), self.config.scroll.smooth) {
+        match TerminalPane::new(id, &opts, cols, lines, cell_w, cell_h, self.event_tx.clone(), Some(self.el_wakeup.clone()), self.scroll_smooth()) {
             Ok(pane) => {
                 self.panes.insert(id, pane);
                 Some(id)
@@ -310,13 +317,14 @@ impl OptixApp {
             .and_then(|p| p.selection_text())
             .filter(|t| !t.is_empty());
         if let Some(text) = text {
-            self.store_clipboard(&text);
-            self.store_selection(&text);
+            self.clipboard.store(ClipboardType::Clipboard, &text);
+            self.clipboard.store(ClipboardType::Selection, &text);
         }
     }
 
     fn paste(&mut self) {
-        if let Some(text) = self.load_clipboard() {
+        let text = self.clipboard.load(ClipboardType::Clipboard);
+        if !text.is_empty() {
             if let Some(pane) = self.focused_pane() {
                 pane.write_str(&text);
             }
@@ -324,60 +332,11 @@ impl OptixApp {
     }
 
     fn paste_selection(&mut self) {
-        if let Some(text) = self.load_selection() {
+        let text = self.clipboard.load(ClipboardType::Selection);
+        if !text.is_empty() {
             if let Some(pane) = self.focused_pane() {
                 pane.write_str(&text);
             }
-        }
-    }
-
-    fn store_clipboard(&mut self, text: &str) {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        if let Some(c) = &mut self.clipboard {
-            let _ = c.set_text(text.to_string());
-        }
-    }
-
-    fn load_clipboard(&mut self) -> Option<String> {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        self.clipboard.as_mut().and_then(|c| c.get_text().ok())
-    }
-
-    /// Store text in the PRIMARY selection buffer (X11 middle-click paste).
-    fn store_selection(&mut self, text: &str) {
-        #[cfg(target_os = "linux")]
-        {
-            use arboard::{LinuxClipboardKind, SetExtLinux};
-            if self.clipboard.is_none() {
-                self.clipboard = arboard::Clipboard::new().ok();
-            }
-            if let Some(c) = &mut self.clipboard {
-                let _ = c.set().clipboard(LinuxClipboardKind::Primary).text(text.to_string());
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = text;
-    }
-
-    /// Load text from the PRIMARY selection buffer (X11 middle-click paste).
-    fn load_selection(&mut self) -> Option<String> {
-        #[cfg(target_os = "linux")]
-        {
-            use arboard::{GetExtLinux, LinuxClipboardKind};
-            if self.clipboard.is_none() {
-                self.clipboard = arboard::Clipboard::new().ok();
-            }
-            self.clipboard
-                .as_mut()
-                .and_then(|c| c.get().clipboard(LinuxClipboardKind::Primary).text().ok())
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
         }
     }
 
@@ -653,17 +612,23 @@ impl OptixApp {
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         let cell_h = self.fonts.as_ref().map(|f| f.cell_h).unwrap_or(16.0);
+        let alacritty = self.config.scroll.mode == crate::config::ScrollMode::Alacritty;
+        // `wheel_lines` doubles as alacritty's `scrolling.multiplier` in
+        // alacritty mode.
+        let multiplier = self.config.scroll.wheel_lines;
         // `lines` is optix's own scrollback distance (scaled by wheel_lines);
         // `steps` is the raw wheel motion apps expect in SGR/X10 reports
         // (a LineDelta of 1.0 is one notch, a PixelDelta is fractional lines).
         let (lines, steps) = match delta {
             MouseScrollDelta::LineDelta(_, y) => {
                 let steps = y as f64;
-                (steps * self.config.scroll.wheel_lines, steps)
+                (steps * multiplier, steps)
             },
             MouseScrollDelta::PixelDelta(pos) => {
                 let steps = pos.y / cell_h as f64;
-                (steps, steps)
+                // Alacritty applies `scrolling.multiplier` to pixel deltas
+                // too; browser mode keeps them at 1:1 (fractional lines).
+                if alacritty { (steps * multiplier, steps) } else { (steps, steps) }
             },
         };
         if lines == 0.0 && steps == 0.0 {
@@ -697,7 +662,32 @@ impl OptixApp {
             }
         }
 
-        let momentum = self.config.scroll.smooth && self.config.scroll.momentum;
+        // Alternate scroll (DECSET 1007, ported from alacritty's
+        // `scroll_terminal`): when a TUI owns the alt screen and asked for
+        // arrow-key scrolling but not mouse reports (vim with mouse off, ...),
+        // turn the wheel into arrow keys. Shift lets the user bypass this and
+        // keep the wheel for the terminal itself.
+        {
+            let Some(pane) = self.panes.get_mut(&id) else { return };
+            if pane.on_alt_screen() && pane.alternate_scroll() && !self.mods.shift {
+                let is_up = lines > 0.0;
+                let n = lines.abs().round() as usize;
+                let mut content = Vec::with_capacity(3 * n);
+                for _ in 0..n {
+                    content.push(0x1b);
+                    content.push(b'O');
+                    content.push(if is_up { b'A' } else { b'B' });
+                }
+                pane.write(&content);
+                return;
+            }
+        }
+
+        // Browser mode: momentum impulse when smooth scrolling is on.
+        // Alacritty mode: instant accumulated line steps (no glide, no
+        // inertia) — the discrete path in ScrollState accumulates fractional
+        // deltas and moves the grid in whole lines, like alacritty.
+        let momentum = !alacritty && self.config.scroll.smooth && self.config.scroll.momentum;
         if let Some(pane) = self.panes.get_mut(&id) {
             pane.scroll_wheel(lines, momentum);
         }
@@ -1121,12 +1111,12 @@ impl OptixApp {
         // Colors are re-resolved from the new theme; the terminal palette is
         // re-derived so every pane immediately uses the new scheme.
         self.palette = Palette::from_theme(&new_cfg.theme);
-        let old_scroll_smooth = self.config.scroll.smooth;
         self.config = new_cfg;
-        if self.config.scroll.smooth != old_scroll_smooth {
-            for pane in self.panes.values_mut() {
-                pane.scroll.smooth = self.config.scroll.smooth;
-            }
+        // Both `smooth` and `mode` decide whether panes glide: in alacritty
+        // mode the discrete (accumulated line-step) path is always used.
+        let smooth = self.scroll_smooth();
+        for pane in self.panes.values_mut() {
+            pane.scroll.smooth = smooth;
         }
 
         let font_changed = self.config.font.family != old_family
@@ -1208,21 +1198,16 @@ impl OptixApp {
                     self.bell_flash = Some(Instant::now());
                 },
                 PaneEventKind::ClipboardStore(ty, text) => {
-                    match ty {
-                        ClipboardType::Clipboard => self.store_clipboard(&text),
-                        ClipboardType::Selection => self.store_selection(&text),
-                    }
+                    self.clipboard.store(ty, text);
                 },
                 PaneEventKind::ClipboardLoad(ty, formatter) => {
-                    let text = match ty {
-                        ClipboardType::Clipboard => self.load_clipboard(),
-                        ClipboardType::Selection => self.load_selection(),
-                    };
-                    if let Some(text) = text {
-                        let formatted = formatter(&text);
-                        if let Some(pane) = self.panes.get_mut(&ev.pane_id) {
-                            pane.write_str(&formatted);
-                        }
+                    // Always answer OSC 52 queries, even when the clipboard is
+                    // empty or errored: `load` returns an empty string instead
+                    // of `None` (alacritty behaviour).
+                    let text = self.clipboard.load(ty);
+                    let formatted = formatter(&text);
+                    if let Some(pane) = self.panes.get_mut(&ev.pane_id) {
+                        pane.write_str(&formatted);
                     }
                 },
                 PaneEventKind::ColorRequest(idx, formatter) => {
